@@ -7,6 +7,7 @@ import os
 import random
 import shutil
 import time
+from dataclasses import asdict
 from itertools import repeat
 from multiprocessing.pool import Pool, ThreadPool
 from pathlib import Path
@@ -95,60 +96,37 @@ def seed_worker(worker_id):
     random.seed(worker_seed)
 
 
-def create_dataloader(path,
-                      imgsz,
-                      batch_size,
-                      stride,
-                      single_cls=False,
-                      hyp=None,
-                      augment=False,
-                      cache=False,
-                      pad=0.0,
-                      rect=False,
-                      rank=-1,
-                      workers=8,
-                      image_weights=False,
-                      close_mosaic=False,
-                      quad=False,
-                      min_items=0,
-                      prefix='',
-                      shuffle=False):
-    if rect and shuffle:
-        LOGGER.warning('WARNING ⚠️ --rect is incompatible with DataLoader shuffle, setting shuffle=False')
-        shuffle = False
+def create_dataloader(cfg, path, stride, rank, batch_size, single_cls, augment=False, pad=0.0,
+                      prefix='', min_items=0, close_mosaic=False, shuffle=False):
+
     with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
-        dataset = LoadImagesAndLabels(
-            path,
-            imgsz,
-            batch_size,
+        dataset = LoadImagesAndLabels(path, cfg.img_size, batch_size,
             augment=augment,  # augmentation
-            hyp=hyp,  # hyperparameters
-            rect=rect,  # rectangular batches
-            cache_images=cache,
+            hyp=asdict(cfg),  # hyperparameters
+            rect=cfg.rect,  # rectangular batches
+            cache_images=cfg.cache_images,
             single_cls=single_cls,
             stride=int(stride),
             pad=pad,
-            image_weights=image_weights,
+            image_weights=cfg.image_weights,
             min_items=min_items,
             prefix=prefix)
 
     batch_size = min(batch_size, len(dataset))
     nd = torch.cuda.device_count()  # number of CUDA devices
-    nw = min([os.cpu_count() // max(nd, 1), batch_size if batch_size > 1 else 0, workers])  # number of workers
+    nw = min([os.cpu_count() // max(nd, 1), batch_size if batch_size > 1 else 0, cfg.workers])  # number of workers
+    shuffle = shuffle and (rank == -1) and (not cfg.rect)
+    collate_fn = LoadImagesAndLabels.collate_fn4 if cfg.quad else LoadImagesAndLabels.collate_fn
+
     sampler = None if rank == -1 else distributed.DistributedSampler(dataset, shuffle=shuffle)
-    #loader = DataLoader if image_weights else InfiniteDataLoader  # only DataLoader allows for attribute updates
-    loader = DataLoader if image_weights or close_mosaic else InfiniteDataLoader
+    loader = DataLoader if cfg.image_weights or close_mosaic else InfiniteDataLoader
     generator = torch.Generator()
     generator.manual_seed(6148914691236517205 + RANK)
-    return loader(dataset,
-                  batch_size=batch_size,
-                  shuffle=shuffle and sampler is None,
-                  num_workers=nw,
-                  sampler=sampler,
-                  pin_memory=PIN_MEMORY,
-                  collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn,
-                  worker_init_fn=seed_worker,
-                  generator=generator), dataset
+
+    out_loader = loader(dataset, batch_size=batch_size,  shuffle=shuffle, num_workers=nw, sampler=sampler,
+                        pin_memory=PIN_MEMORY, collate_fn=collate_fn, worker_init_fn=seed_worker, enerator=generator)
+
+    return out_loader, dataset
 
 
 class InfiniteDataLoader(dataloader.DataLoader):
