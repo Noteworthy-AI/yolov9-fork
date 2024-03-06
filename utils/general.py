@@ -32,7 +32,6 @@ import torchvision
 import yaml
 
 from utils import TryExcept, emojis
-from utils.downloads import gsutil_getsize
 from utils.metrics import box_iou, fitness
 
 FILE = Path(__file__).resolve()
@@ -1018,12 +1017,6 @@ def print_mutation(keys, results, hyp, save_dir, bucket, prefix=colorstr('evolve
     vals = results + tuple(hyp.values())
     n = len(keys)
 
-    # Download (optional)
-    if bucket:
-        url = f'gs://{bucket}/evolve.csv'
-        if gsutil_getsize(url) > (evolve_csv.stat().st_size if evolve_csv.exists() else 0):
-            os.system(f'gsutil cp {url} {save_dir}')  # download evolve.csv if larger than local
-
     # Log to evolve.csv
     s = '' if evolve_csv.exists() else (('%20s,' * n % keys).rstrip(',') + '\n')  # add header
     with open(evolve_csv, 'a') as f:
@@ -1044,9 +1037,6 @@ def print_mutation(keys, results, hyp, save_dir, bucket, prefix=colorstr('evolve
     LOGGER.info(prefix + f'{generations} generations finished, current result:\n' + prefix +
                 ', '.join(f'{x.strip():>20s}' for x in keys) + '\n' + prefix + ', '.join(f'{x:20.5g}'
                                                                                          for x in vals) + '\n\n')
-
-    if bucket:
-        os.system(f'gsutil cp {evolve_csv} {evolve_yaml} gs://{bucket}')  # upload
 
 
 def apply_classifier(x, model, img, im0):

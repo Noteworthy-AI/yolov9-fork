@@ -34,8 +34,7 @@ from utils.general import (LOGGER, TQDM_BAR_FORMAT, check_amp, check_dataset, ch
                            check_suffix, check_yaml, colorstr, get_latest_run, increment_path, init_seeds,
                            intersect_dicts, labels_to_class_weights, labels_to_image_weights, methods,
                            one_cycle, one_flat_cycle, print_args, print_mutation, strip_optimizer, yaml_save)
-from utils.loggers import Loggers
-from utils.loggers.comet.comet_utils import check_comet_resume
+
 from utils.loss_tal import ComputeLoss
 from utils.metrics import fitness
 from utils.plots import plot_evolve
