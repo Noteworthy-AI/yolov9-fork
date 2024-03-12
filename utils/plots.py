@@ -20,7 +20,6 @@ from utils.general import (CONFIG_DIR, FONT, LOGGER, check_font, check_requireme
 from utils.metrics import fitness
 
 # Settings
-RANK = int(os.getenv('RANK', -1))
 matplotlib.rc('font', **{'size': 11})
 matplotlib.use('Agg')  # for writing to files only
 
@@ -251,6 +250,8 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None):
                 if labels or conf[j] > 0.25:  # 0.25 conf thresh
                     label = f'{cls}' if labels else f'{cls} {conf[j]:.1f}'
                     annotator.box_label(box, label, color=color)
+
+    # Check if image is being saved valid
     annotator.im.save(fname)  # save
 
 

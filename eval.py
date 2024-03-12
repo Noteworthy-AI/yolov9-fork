@@ -1,3 +1,7 @@
+import os
+import cv2
+import glob
+import wandb
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -37,9 +41,12 @@ def process_batch(detections, labels, iouv):
 
 @smart_inference_mode()
 def evaluate(cfg, dataloader, batch_size, device, n_classes, mode="test", model=None, conf_thres=0.001, iou_thres=0.7,
-         max_det=300, augment=False, verbose=False, half_precision=True, plots=True, compute_loss=None):
+             max_det=300, augment=False, verbose=False, half_precision=True, plots=True, compute_loss=None,
+             wandb_logger=None, n_pred_plot=3):
 
-    plot_save_dir = cfg.get_local_output_dir(exist_ok=True)
+    plot_save_dir = os.path.join(cfg.get_local_output_dir(exist_ok=True), f"{mode}_plot_ims")
+    os.makedirs(plot_save_dir, exist_ok=True)
+    curr_epoch = wandb_logger.current_epoch
 
     # Initialize/load model and set device
     cuda = device.type != 'cpu'
@@ -66,12 +73,18 @@ def evaluate(cfg, dataloader, batch_size, device, n_classes, mode="test", model=
         names = dict(enumerate(names))
 
     s = ('%22s' + '%11s' * 6) % ('Class', 'Images', 'Instances', 'P', 'R', 'mAP50', 'mAP50-95')
-    tp, fp, p, r, f1, mp, mr, map50, ap50, map = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    tp, fp, p50, r50, maxf1, mp, mr, map50, ap50, map95, ap95 = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     dt = Profile(), Profile(), Profile()  # profiling times
     loss = torch.zeros(3, device=device)
-    jdict, stats, ap, ap_class = [], [], [], []
+    jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
+
+    # Logging
+    log_imgs = 0
+    if wandb_logger and wandb_logger.wandb:
+        log_imgs = min(wandb_logger.log_imgs, 100)
 
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
+    plot_threads = []
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
         with dt[0]:
             if cuda:
@@ -115,6 +128,16 @@ def evaluate(cfg, dataloader, batch_size, device, n_classes, mode="test", model=
             predn = pred.clone()
             scale_boxes(im[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
 
+            # W&B log validation images + predictions
+            if (len(wandb_images) < log_imgs) and (curr_epoch > 0) and (curr_epoch % wandb_logger.bbox_interval == 0):
+                box_data = [{"position": {"minX": xyxy[0], "minY": xyxy[1], "maxX": xyxy[2], "maxY": xyxy[3]},
+                             "class_id": int(cls),
+                             "box_caption": "%s %.3f" % (names[cls], conf),
+                             "scores": {"class_score": conf},
+                             "domain": "pixel"} for *xyxy, conf, cls in pred.tolist()]
+                boxes = {"predictions": {"box_data": box_data, "class_labels": names}}  # inference-space
+                wandb_images.append(wandb_logger.wandb.Image(im[si], boxes=boxes, caption=path.name))
+
             # Evaluate
             if nl:
                 tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
@@ -126,28 +149,31 @@ def evaluate(cfg, dataloader, batch_size, device, n_classes, mode="test", model=
             stats.append((correct, pred[:, 4], pred[:, 5], labels[:, 0]))  # (correct, conf, pcls, tcls)
 
         # Plot images
-        if plots and batch_i < 3:
-            plot_images(im, targets, paths, plot_save_dir / f'val_batch{batch_i}_labels.jpg', names)  # labels
-            plot_images(im, output_to_target(preds), paths, plot_save_dir / f'val_batch{batch_i}_pred.jpg', names)  # pred
+        if plots and batch_i < n_pred_plot:
+            lb_plot_path = Path(plot_save_dir) / f'ex_b{batch_i}_labels.png'
+            pred_plot_path = Path(plot_save_dir) / f'ex_b{batch_i}_preds.png'
+            lb_plot_thread = plot_images(im, targets, paths, lb_plot_path, names=names)   # labels
+            pred_plot_thread = plot_images(im, targets, paths, pred_plot_path, names=names)  # preds
+            threadjoin_status = [thread.join() for thread in [lb_plot_thread, pred_plot_thread]]
 
     # Compute metrics
     stats = [torch.cat(x, 0).cpu().numpy() for x in zip(*stats)]  # to numpy
     if len(stats) and stats[0].any():
-        tp, fp, p, r, f1, ap, ap_class = ap_per_class(*stats, plot=plots, save_dir=plot_save_dir, names=names)
-        ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
-        mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
+        tp, fp, p50, r50, maxf1, ap, ap_class = ap_per_class(*stats, plot=plots, save_dir=plot_save_dir, names=names)
+        ap50, ap95 = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
+        mp, mr, map50, map95 = p50.mean(), r50.mean(), ap50.mean(), ap95.mean()
     nt = np.bincount(stats[3].astype(int), minlength=n_classes)  # number of targets per class
 
     # Print results
     pf = '%22s' + '%11i' * 2 + '%11.3g' * 4  # print format
-    print(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
+    print(pf % ('all', seen, nt.sum(), mp, mr, map50, map95))
     if nt.sum() == 0:
         print(f'WARNING ⚠️ no labels found in {mode} set, can not compute metrics without labels')
 
     # Print results per class
     if (verbose or (n_classes < 50 and mode != "val")) and n_classes > 1 and len(stats):
         for i, c in enumerate(ap_class):
-            print(pf % (names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i]))
+            print(pf % (names[c], seen, nt[c], p50[i], r50[i], ap50[i], ap95[i]))
 
     # Print speeds
     t = tuple(x.t / seen * 1E3 for x in dt)  # speeds per image
@@ -155,13 +181,51 @@ def evaluate(cfg, dataloader, batch_size, device, n_classes, mode="test", model=
         shape = (batch_size, 3, cfg.training.img_size, cfg.training.img_size)
         print(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {shape}' % t)
 
-    # Plots
     if plots:
+        # Plot confusion matrix
         confusion_matrix.plot(save_dir=plot_save_dir, names=list(names.values()))
 
-    # Return results
-    model.float()  # for training
-    maps = np.zeros(n_classes) + map
+        # W&B log class-wise precision
+        if wandb_logger and wandb_logger.wandb:
+            if isinstance(maxf1, np.ndarray):
+                maxf1 = maxf1.mean()
+            rounded_max_f1 = round(maxf1, 3)
+            precision_recall_table = wandb.Table(
+                columns=['Category', f'Precision_@{rounded_max_f1}', f'Recall_@{rounded_max_f1}'],
+                data=[[names[c], p50[i], r50[i]] for i, c in enumerate(ap_class)])
+            wandb_logger.log({f'pr_tables/{mode}-split': precision_recall_table})
+
+        # W&B log all validation artifact images
+        ex_ims = sorted(glob.glob(os.path.join(plot_save_dir, 'ex_b*.png')))
+        wb_ex_ims = [wandb_logger.wandb.Image(f, caption='ep{}_{}'.format(curr_epoch, os.path.basename(f))) for f in ex_ims]
+        wandb_logger.log({'{}-prediction-examples'.format(mode): wb_ex_ims})
+
+        m_fns = ["confusion_matrix.png", "PR_curve.png", "F1_curve.png", "P_curve.png", "R_curve.png"]
+        m_ims = [os.path.join(plot_save_dir, im_name) for im_name in m_fns]
+        wb_m_ims = [wandb_logger.wandb.Image(f, caption='ep{}_{}'.format(curr_epoch, os.path.basename(f))) for f in m_ims]
+        wandb_logger.log({'{}-metric-plots'.format(mode): wb_m_ims})
+
+        if wandb_images:
+            wandb_logger.log({"Predictions per epoch (val set)/Images": wandb_images})
+
+
+    # Per-class mAP@0.95
+    map95s = np.zeros(n_classes)
     for i, c in enumerate(ap_class):
-        maps[c] = ap[i]
-    return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
+        map95s[c] = ap95[i]
+
+    # Return validation precision and recall per class
+    ap_class_list = list(ap_class)
+    class_names, classes_precision, classes_recall = [], [], []
+    for i in range(len(names)):
+        if i in ap_class_list:
+            classes_precision.append(p50[ap_class_list.index(i)])
+            classes_recall.append(r50[ap_class_list.index(i)])
+        else:
+            classes_precision.append(0.0)
+            classes_recall.append(0.0)
+
+    model.float()  # for training
+
+    formatted_results = (mp, mr, map50, map95, *(loss.cpu() / len(dataloader)).tolist())
+    return formatted_results, map95s, t, names, classes_precision, classes_recall, wandb_logger

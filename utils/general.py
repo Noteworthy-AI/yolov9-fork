@@ -36,7 +36,6 @@ from utils.metrics import box_iou, fitness
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLO root directory
-RANK = int(os.getenv('RANK', -1))
 
 # Settings
 NUM_THREADS = min(8, max(1, os.cpu_count() - 1))  # number of YOLOv5 multiprocessing threads
@@ -111,7 +110,7 @@ LOGGING_NAME = "yolov5"
 
 def set_logging(name=LOGGING_NAME, verbose=True):
     # sets up logging for the given name
-    rank = int(os.getenv('RANK', -1))  # rank in world for Multi-GPU trainings
+    rank = int(os.getenv('OMPI_COMM_WORLD_RANK', -1))  # rank in world for Multi-GPU trainings
     level = logging.INFO if verbose and rank in {-1, 0} else logging.ERROR
     logging.config.dictConfig({
         "version": 1,
