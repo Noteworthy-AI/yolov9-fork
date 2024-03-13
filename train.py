@@ -19,7 +19,8 @@ from eval import evaluate
 from models.yolo import Model
 from utils.plots import plot_images
 from utils.metrics import fitness
-from utils.loss_tal import ComputeLoss
+from utils.loss_tal import ComputeLoss as ComputeLossGELAN
+from utils.loss_tal_dual import ComputeLoss as ComputeLossPGI
 from utils.dataloaders import create_dataloader
 from utils.autobatch import check_train_batch_size
 from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, smart_DDP, smart_optimizer, torch_distributed_zero_first
@@ -180,8 +181,13 @@ def train(cfg, device, wandb_logger, mldb_logger):
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=train_cfg.patience), False
-    compute_loss = ComputeLoss(model)  # init loss class
-
+    model_arch_type = cfg.get_model_arch_type()
+    if model_arch_type == "gelan":
+        compute_loss = ComputeLossGELAN(model)  # Loss function for GELAN architecture
+    elif model_arch_type == "pgi":
+        compute_loss = ComputeLossPGI(model)  # Loss function for full YOLOv9 (GELAN+PGI) architecture
+    else:
+        raise Exception("Invalid model architecture type")
     print(f"Using {train_loader.num_workers * train_cfg.world_size} workers across {train_cfg.world_size} devices")
     print(f'Starting training for {train_cfg.epochs} epochs...')
     print(f"Model device = {model.device} device type = {model.device_type}, device_ids = {model.device_ids}")
