@@ -61,7 +61,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
     ckpt = torch.load(local_w_pth, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
     model_cfg = cfg.get_model_cfg()
     model = Model(model_cfg, ch=3, nc=nc, anchors=train_cfg.anchors).to(device)  # create
-    exclude = ['anchor'] if not cfg.resume else []  # exclude keys
+    exclude = ['anchor'] if not cfg.resume.enabled else []  # exclude keys
     state_dict = ckpt['model'].float().state_dict()  # to FP32
     state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
     model.load_state_dict(state_dict, strict=False)  # load
@@ -71,8 +71,8 @@ def train(cfg, device, wandb_logger, mldb_logger):
     # Initialize W&B logging
     with torch_distributed_zero_first(train_cfg.local_rank):
         if train_cfg.global_rank in {-1, 0}:
-            wandb_run_id = ckpt.get('wandb_id') if local_w_pth.endswith('.pt') and os.path.isfile(local_w_pth) else None
-            wandb_logger.init(wandb_run_id)
+            last_epoch = ckpt.get('epoch') if cfg.resume.enabled else None
+            wandb_logger.init(last_epoch)
             mldb_logger.log_configs()
 
     # Freeze
@@ -125,8 +125,9 @@ def train(cfg, device, wandb_logger, mldb_logger):
 
     # Resume
     best_fitness, start_epoch = 0.0, 0
-    if cfg.resume:
-        pass    # TODO: fix resume from checkpoint
+    if cfg.resume.enabled:
+        start_epoch = ckpt.get('epoch')
+        best_fitness = ckpt.get('best_fitness')
     del ckpt, state_dict
 
     # DP mode
@@ -156,7 +157,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
     with torch_distributed_zero_first(train_cfg.local_rank):
         val_loader, _ = create_dataloader(train_cfg, val_path, gs, batch_size, (nc == 1), pad=0.5, prefix=colorstr('val: '))
 
-        if not cfg.resume:
+        if not cfg.resume.enabled:
             # TODO: autoanchor???
             model.half().float()  # pre-reduce anchor precision
 
@@ -220,7 +221,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
         if train_cfg.global_rank in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
             metrics_header = ('%11s' * 7) % ( 'Pre', 'Rec', 'mAP@0.5', 'mAP@0.95', 'box_loss', 'obj_loss', 'cls_loss')
-            if not cfg.resume:
+            if not cfg.resume.enabled:
                 with open(results_file, 'a') as f:
                     f.write(progress_header + metrics_header)
 
@@ -342,7 +343,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
                     print("Logging validation results")
                     print(wandb_log_metrics)
                     wandb_logger.log(wandb_log_metrics)  # W&B
-                    wandb_logger.end_epoch(best_result=is_best_model)
+                    wandb_logger.end_epoch(save_step=True)
 
                 # Local metric log for ML DB
                 # Write
@@ -373,10 +374,9 @@ def train(cfg, device, wandb_logger, mldb_logger):
                         torch.save(ckpt, ep_ckpt_save_pth)
 
                     if ((epoch + 1) % train_cfg.save_period == 0 and not final_epoch):
-                        mldb_logger.log_checkpoint(ckpt, ep_ckpt_save_pth)
+                        s3_uri = mldb_logger.log_checkpoint(ckpt, ep_ckpt_save_pth, return_s3_uri = True)
                         if wandb_logger.wandb:
-                            # TODO: implement W&B artifacts
-                            pass
+                            wandb_logger.save_s3_ckpt_artifact(s3_uri, aliases = [f"epoch-{epoch}"])
                     del ckpt
 
         # EarlyStopping
