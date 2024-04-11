@@ -30,7 +30,7 @@ from utils.general import TQDM_BAR_FORMAT, check_amp, check_img_size, colorstr, 
 
 def train(cfg, device, wandb_logger, mldb_logger):
     # TODO: switch from print to logger?
-    print("YOLOv7 Training Run")
+    print("YOLOv9 Training Run")
     print("Initializing configs & logging")
 
     train_cfg = cfg.training
@@ -73,7 +73,8 @@ def train(cfg, device, wandb_logger, mldb_logger):
         if train_cfg.global_rank in {-1, 0}:
             last_epoch = ckpt.get('epoch') if cfg.resume.enabled else None
             wandb_logger.init(last_epoch)
-            mldb_logger.log_configs()
+            cfg_s3_uri = mldb_logger.log_configs(return_s3_uri=True)
+            wandb_logger.save_s3_artifact(cfg_s3_uri, [], artifact_type="config")
 
     # Freeze
     # parameter names to freeze (full or partial)
@@ -191,7 +192,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
         raise Exception("Invalid model architecture type")
     print(f"Using {train_loader.num_workers * train_cfg.world_size} workers across {train_cfg.world_size} devices")
     print(f'Starting training for {train_cfg.epochs} epochs...')
-    print(f"Model device = {model.device} device type = {model.device_type}, device_ids = {model.device_ids}")
+    # print(f"Model device = {model.device} device type = {model.device_type}, device_ids = {model.device_ids}")
     print_batch_dims = True
 
     # Main Training Loop
@@ -217,7 +218,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
         progress_header = ('%11s' * 7) % ('Epoch', 'GPU_mem', 'box_loss', 'cls_loss', 'dfl_loss', 'Instances', 'Size')
         progress_str = ""
         pbar = enumerate(train_loader)
-        is_best_model = False
+        is_best_model = False 
         if train_cfg.global_rank in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
             metrics_header = ('%11s' * 7) % ( 'Pre', 'Rec', 'mAP@0.5', 'mAP@0.95', 'box_loss', 'obj_loss', 'cls_loss')
@@ -292,7 +293,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
                     plotted_ims = [wandb_logger.wandb.Image(str(fp), caption=os.path.basename(fp))
                                    for fp in glob.glob(os.path.join(save_dir, "train_plot_ims", 'train*.jpg'))
                                    if os.path.exists(fp)]
-                    wandb_logger.log({"Training input": plotted_ims})
+                    wandb_logger.log({"Training input": plotted_ims}, log_type="images")
         # end batch ------------------------------------------------------------------------------------------------
 
         # Scheduler
@@ -318,6 +319,8 @@ def train(cfg, device, wandb_logger, mldb_logger):
                     is_best_model = True
                 else:
                     is_best_model = False
+                
+                wandb_logger.current_epoch_is_best = is_best_model
 
                 # W&B log training & validation results
                 wandb_log_metrics = {
@@ -343,7 +346,9 @@ def train(cfg, device, wandb_logger, mldb_logger):
                     print("Logging validation results")
                     print(wandb_log_metrics)
                     wandb_logger.log(wandb_log_metrics)  # W&B
-                    wandb_logger.end_epoch(save_step=True)
+
+                    log_images = train_cfg.save_period > 0 and epoch % train_cfg.save_period == 0
+                    wandb_logger.end_epoch(log_images=log_images)
 
                 # Local metric log for ML DB
                 # Write
@@ -373,10 +378,10 @@ def train(cfg, device, wandb_logger, mldb_logger):
                     if train_cfg.save_period > 0 and epoch % train_cfg.save_period == 0:
                         torch.save(ckpt, ep_ckpt_save_pth)
 
-                    if ((epoch + 1) % train_cfg.save_period == 0 and not final_epoch):
-                        s3_uri = mldb_logger.log_checkpoint(ckpt, ep_ckpt_save_pth, return_s3_uri = True)
-                        if wandb_logger.wandb:
-                            wandb_logger.save_s3_ckpt_artifact(s3_uri, aliases = [f"epoch-{epoch}"])
+                        if (not final_epoch):
+                            s3_uri = mldb_logger.log_checkpoint(ckpt, ep_ckpt_save_pth, return_s3_uri = True)
+                            if wandb_logger.wandb:
+                                wandb_logger.save_s3_artifact(s3_uri, aliases = [f"epoch-{epoch}"])
                     del ckpt
 
         # EarlyStopping

@@ -129,7 +129,7 @@ def evaluate(cfg, dataloader, batch_size, device, n_classes, mode="test", model=
             scale_boxes(im[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
 
             # W&B log validation images + predictions
-            if (len(wandb_images) < log_imgs) and (curr_epoch > 0) and (curr_epoch % wandb_logger.bbox_interval == 0):
+            if (len(wandb_images) < log_imgs):  # and (curr_epoch > 0) and (curr_epoch % wandb_logger.bbox_interval == 0):
                 box_data = [{"position": {"minX": xyxy[0], "minY": xyxy[1], "maxX": xyxy[2], "maxY": xyxy[3]},
                              "class_id": int(cls),
                              "box_caption": "%s %.3f" % (names[cls], conf),
@@ -198,15 +198,15 @@ def evaluate(cfg, dataloader, batch_size, device, n_classes, mode="test", model=
         # W&B log all validation artifact images
         ex_ims = sorted(glob.glob(os.path.join(plot_save_dir, 'ex_b*.png')))
         wb_ex_ims = [wandb_logger.wandb.Image(f, caption='ep{}_{}'.format(curr_epoch, os.path.basename(f))) for f in ex_ims]
-        wandb_logger.log({'{}-prediction-examples'.format(mode): wb_ex_ims})
+        wandb_logger.log({'{}-prediction-examples'.format(mode): wb_ex_ims}, log_type="images")
 
         m_fns = ["confusion_matrix.png", "PR_curve.png", "F1_curve.png", "P_curve.png", "R_curve.png"]
         m_ims = [os.path.join(plot_save_dir, im_name) for im_name in m_fns]
         wb_m_ims = [wandb_logger.wandb.Image(f, caption='ep{}_{}'.format(curr_epoch, os.path.basename(f))) for f in m_ims]
-        wandb_logger.log({'{}-metric-plots'.format(mode): wb_m_ims})
+        wandb_logger.log({'{}-metric-plots'.format(mode): wb_m_ims}, log_type="images")
 
         if wandb_images:
-            wandb_logger.log({"Predictions per epoch (val set)/Images": wandb_images})
+            wandb_logger.log({"Predictions per epoch (val set)/Images": wandb_images}, log_type="images")
 
 
     # Per-class mAP@0.95
