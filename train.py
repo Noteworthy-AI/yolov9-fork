@@ -74,7 +74,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
             last_epoch = ckpt.get('epoch') if cfg.resume.enabled else None
             wandb_logger.init(last_epoch)
             cfg_s3_uri = mldb_logger.log_configs(return_s3_uri=True)
-            wandb_logger.save_s3_artifact(cfg_s3_uri, [], artifact_type="config")
+            wandb_logger.save_s3_artifact(cfg_s3_uri, cfg.model_name, [], artifact_type="config")
 
     # Freeze
     # parameter names to freeze (full or partial)
@@ -192,7 +192,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
         raise Exception("Invalid model architecture type")
     print(f"Using {train_loader.num_workers * train_cfg.world_size} workers across {train_cfg.world_size} devices")
     print(f'Starting training for {train_cfg.epochs} epochs...')
-    # print(f"Model device = {model.device} device type = {model.device_type}, device_ids = {model.device_ids}")
+    print(f"Model device = {model.device} device type = {model.device_type}, device_ids = {model.device_ids}")
     print_batch_dims = True
 
     # Main Training Loop
@@ -346,9 +346,8 @@ def train(cfg, device, wandb_logger, mldb_logger):
                     print("Logging validation results")
                     print(wandb_log_metrics)
                     wandb_logger.log(wandb_log_metrics)  # W&B
-
-                    log_images = train_cfg.save_period > 0 and epoch % train_cfg.save_period == 0
-                    wandb_logger.end_epoch(log_images=log_images)
+                    
+                    wandb_logger.end_epoch()
 
                 # Local metric log for ML DB
                 # Write
@@ -381,7 +380,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
                         if (not final_epoch):
                             s3_uri = mldb_logger.log_checkpoint(ckpt, ep_ckpt_save_pth, return_s3_uri = True)
                             if wandb_logger.wandb:
-                                wandb_logger.save_s3_artifact(s3_uri, aliases = [f"epoch-{epoch}"])
+                                wandb_logger.save_s3_artifact(s3_uri, cfg.model_name, aliases = [f"epoch-{epoch}"])
                     del ckpt
 
         # EarlyStopping
