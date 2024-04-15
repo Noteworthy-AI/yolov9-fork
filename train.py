@@ -13,6 +13,7 @@ from pathlib import Path
 from copy import deepcopy
 from datetime import datetime
 from dataclasses import asdict
+from PIL import Image
 from torch.optim import lr_scheduler
 
 from eval import evaluate
@@ -127,8 +128,19 @@ def train(cfg, device, wandb_logger, mldb_logger):
     # Resume
     best_fitness, start_epoch = 0.0, 0
     if cfg.resume.enabled:
-        start_epoch = ckpt.get('epoch')
-        best_fitness = ckpt.get('best_fitness')
+        if ckpt.get('epoch') and\
+           isinstance(ckpt.get('epoch'), int) and\
+           ckpt.get('epoch') not in [0, -1]:
+            start_epoch = ckpt.get('epoch')
+        else:
+            print("Stored epoch in checkpoint is not correct. Starting from scratch")
+
+        if ckpt.get('best_fitness') and\
+           isinstance(ckpt.get('best_fitness'), np.ndarray):
+            best_fitness = ckpt.get('best_fitness')
+        else:
+            print("Stored best_fitness in checkpoint is not correct. Starting from scratch")
+
     del ckpt, state_dict
 
     # DP mode
@@ -290,7 +302,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
                     f = os.path.join(save_dir, "train_plot_ims", 'train_batch{}.jpg'.format(ni)) # filename
                     plot_images(imgs, targets, paths, f)
                 elif plots and ni == 10 and wandb_logger.wandb:
-                    plotted_ims = [wandb_logger.wandb.Image(str(fp), caption=os.path.basename(fp))
+                    plotted_ims = [wandb_logger.wandb.Image(Image.open(str(fp)), caption=os.path.basename(fp))
                                    for fp in glob.glob(os.path.join(save_dir, "train_plot_ims", 'train*.jpg'))
                                    if os.path.exists(fp)]
                     wandb_logger.log({"Training input": plotted_ims}, log_type="images")
@@ -346,7 +358,6 @@ def train(cfg, device, wandb_logger, mldb_logger):
                     print("Logging validation results")
                     print(wandb_log_metrics)
                     wandb_logger.log(wandb_log_metrics)  # W&B
-                    
                     wandb_logger.end_epoch()
 
                 # Local metric log for ML DB
