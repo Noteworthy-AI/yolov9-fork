@@ -199,10 +199,10 @@ def evaluate(cfg, dataloader, batch_size, device, n_classes, mode="test", model=
         m_fns = ["confusion_matrix.png", "PR_curve.png", "F1_curve.png", "P_curve.png", "R_curve.png"]
         m_ims = [os.path.join(plot_save_dir, im_name) for im_name in m_fns]
         wb_m_ims = [wandb_logger.wandb.Image(Image.open(f), caption='ep{}_{}'.format(curr_epoch, os.path.basename(f))) for f in m_ims]
-        wandb_logger.log({'{}-metric-plots'.format(mode): wb_m_ims}, log_type="images")
+        wandb_logger.log({'{}-metric-plots'.format(mode): wb_m_ims}, log_type=wandb_logger.tracked_logs.BestCandidateLogType)
 
         if wandb_images:
-            wandb_logger.log({"Predictions per epoch (val set)/Images": wandb_images}, log_type="images")
+            wandb_logger.log({"Predictions per epoch (val set)/Images": wandb_images}, log_type=wandb_logger.tracked_logs.EpochLogType)
 
 
     # Per-class mAP@0.95

@@ -131,15 +131,16 @@ def train(cfg, device, wandb_logger, mldb_logger):
         if ckpt.get('epoch') and\
            isinstance(ckpt.get('epoch'), int) and\
            ckpt.get('epoch') not in [0, -1]:
-            start_epoch = ckpt.get('epoch')
+            start_epoch = ckpt.get('epoch') + 1
+            assert start_epoch < train_cfg.epochs, f"Start epoch {start_epoch} from checkpoint cannot be higher than total epochs {train_cfg.epochs}."
         else:
-            print("Stored epoch in checkpoint is not correct. Starting from scratch")
+            print("Stored epoch in checkpoint is not correct. Starting epoch from scratch")
 
         if ckpt.get('best_fitness') and\
            isinstance(ckpt.get('best_fitness'), np.ndarray):
             best_fitness = ckpt.get('best_fitness')
         else:
-            print("Stored best_fitness in checkpoint is not correct. Starting from scratch")
+            print("Stored best_fitness in checkpoint is not correct. Starting best_fitness from scratch")
 
     del ckpt, state_dict
 
