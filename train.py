@@ -306,7 +306,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
 
                 ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
                 final_epoch = (epoch + 1 == train_cfg.epochs) or stopper.possible_stop
-                wandb_logger.current_epoch = epoch + 1
+                wandb_logger.current_epoch = epoch
                 val_out = evaluate(cfg, val_loader, batch_size, device, nc, mode="val", half_precision=amp, model=ema.ema,
                                    plots=True, compute_loss=compute_loss, wandb_logger=wandb_logger)
                 val_results, map95s, t, val_cls_names, val_cls_p, val_cls_r, wandb_logger = val_out
