@@ -24,7 +24,7 @@ from utils.loss_tal import ComputeLoss as ComputeLossGELAN
 from utils.loss_tal_dual import ComputeLoss as ComputeLossPGI
 from utils.dataloaders import create_dataloader
 from utils.autobatch import check_train_batch_size
-from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, smart_DDP, smart_optimizer, torch_distributed_zero_first
+from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, smart_DDP, smart_optimizer, smart_resume, torch_distributed_zero_first
 from utils.general import TQDM_BAR_FORMAT, check_amp, check_img_size, colorstr, init_seeds, intersect_dicts, \
     labels_to_class_weights, labels_to_image_weights, one_cycle, one_flat_cycle, strip_optimizer
 
@@ -37,7 +37,6 @@ def train(cfg, device, wandb_logger, mldb_logger):
     train_cfg = cfg.training
     nc = cfg.get_n_classes()  # number of classes
     names = cfg.dset.class_list  # class names
-
     # Directories & filepaths
     save_dir = cfg.get_local_output_dir(exist_ok=True)
     results_file = os.path.join(save_dir, "results.txt")
@@ -128,19 +127,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
     # Resume
     best_fitness, start_epoch = 0.0, 0
     if cfg.resume.enabled:
-        if ckpt.get('epoch') and\
-           isinstance(ckpt.get('epoch'), int) and\
-           ckpt.get('epoch') not in [0, -1]:
-            start_epoch = ckpt.get('epoch') + 1
-            assert start_epoch < train_cfg.epochs, f"Start epoch {start_epoch} from checkpoint cannot be higher than total epochs {train_cfg.epochs}."
-        else:
-            print("Stored epoch in checkpoint is not correct. Starting epoch from scratch")
-
-        if ckpt.get('best_fitness') and\
-           isinstance(ckpt.get('best_fitness'), np.ndarray):
-            best_fitness = ckpt.get('best_fitness')
-        else:
-            print("Stored best_fitness in checkpoint is not correct. Starting best_fitness from scratch")
+        best_fitness, start_epoch = smart_resume(ckpt, optimizer, ema, train_cfg.epochs)
 
     del ckpt, state_dict
 
@@ -306,7 +293,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
                     plotted_ims = [wandb_logger.wandb.Image(Image.open(str(fp)), caption=os.path.basename(fp))
                                    for fp in glob.glob(os.path.join(save_dir, "train_plot_ims", 'train*.jpg'))
                                    if os.path.exists(fp)]
-                    wandb_logger.log({"Training input": plotted_ims}, log_type="images")
+                    wandb_logger.log({"Training input": plotted_ims}, log_type=wandb_logger.tracked_logs.AlwaysLogType)
         # end batch ------------------------------------------------------------------------------------------------
 
         # Scheduler
@@ -359,7 +346,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
                     print("Logging validation results")
                     print(wandb_log_metrics)
                     wandb_logger.log(wandb_log_metrics)  # W&B
-                    wandb_logger.end_epoch()
+                    wandb_logger.end_epoch(train_cfg.save_period > 0 and epoch % train_cfg.save_period == 0)
 
                 # Local metric log for ML DB
                 # Write
@@ -388,6 +375,8 @@ def train(cfg, device, wandb_logger, mldb_logger):
                         torch.save(ckpt, best_weight_pth)
                     if train_cfg.save_period > 0 and epoch % train_cfg.save_period == 0:
                         torch.save(ckpt, ep_ckpt_save_pth)
+                        if train_cfg.optimize_ckpt_epochs:
+                            strip_optimizer(ep_ckpt_save_pth)
 
                         if (not final_epoch):
                             s3_uri = mldb_logger.log_checkpoint(ckpt, ep_ckpt_save_pth, return_s3_uri = True)
