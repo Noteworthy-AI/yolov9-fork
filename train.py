@@ -75,7 +75,10 @@ def train(cfg, device, wandb_logger, mldb_logger):
             wandb_logger.init(last_epoch)
             cfg_s3_uri = mldb_logger.log_configs(return_s3_uri=True)
             wandb_logger.save_s3_artifact(cfg_s3_uri, cfg.model_name, [], artifact_type="config")
-
+            train_im_fns = [fn for fn in os.listdir(os.path.join(train_path, "images")) if fn.endswith(".jpg")]
+            val_im_fns = [fn for fn in os.listdir(os.path.join(val_path, "images")) if fn.endswith(".jpg")]
+            train_val_split = {"train": train_im_fns, "val": val_im_fns}
+            wandb_logger.save_json_artifact(train_val_split, cfg.model_name, [], "dataset")
     # Freeze
     # parameter names to freeze (full or partial)
     freeze = cfg.model.freeze
