@@ -451,24 +451,21 @@ def smart_hub_load(repo='ultralytics/yolov5', model='yolov5s', **kwargs):
         return torch.hub.load(repo, model, force_reload=True, **kwargs)
 
 
-def smart_resume(ckpt, optimizer, ema=None, weights='yolov5s.pt', epochs=300, resume=True):
+def smart_resume(ckpt, optimizer, ema, epochs):
     # Resume training from a partially trained checkpoint
     best_fitness = 0.0
-    start_epoch = ckpt['epoch'] + 1
-    if ckpt['optimizer'] is not None:
+    start_epoch = 0
+    if ckpt.get('epoch') and isinstance(ckpt.get('epoch'), int):
+        start_epoch = ckpt['epoch'] + 1
+    if optimizer and ckpt.get('optimizer') and ckpt.get('best_fitness'):
         optimizer.load_state_dict(ckpt['optimizer'])  # optimizer
         best_fitness = ckpt['best_fitness']
-    if ema and ckpt.get('ema'):
+    if ema and ckpt.get('ema') and ckpt.get('updates'):
         ema.ema.load_state_dict(ckpt['ema'].float().state_dict())  # EMA
         ema.updates = ckpt['updates']
-    if resume:
-        assert start_epoch > 0, f'{weights} training to {epochs} epochs is finished, nothing to resume.\n' \
-                                f"Start a new training without --resume, i.e. 'python train.py --weights {weights}'"
-        LOGGER.info(f'Resuming training from {weights} from epoch {start_epoch} to {epochs} total epochs')
     if epochs < start_epoch:
-        LOGGER.info(f"{weights} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {epochs} more epochs.")
-        epochs += ckpt['epoch']  # finetune additional epochs
-    return best_fitness, start_epoch, epochs
+        assert start_epoch < epochs, f"Start epoch {start_epoch} from checkpoint cannot be higher than total epochs {epochs}."
+    return best_fitness, start_epoch
 
 
 class EarlyStopping:

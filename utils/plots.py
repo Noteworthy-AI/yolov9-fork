@@ -203,6 +203,7 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None):
     ns = np.ceil(bs ** 0.5)  # number of subplots (square)
     if np.max(images[0]) <= 1:
         images *= 255  # de-normalise (optional)
+    images = 255 - images  # Temporal fix for inverted images 
 
     # Build Image
     mosaic = np.full((int(ns * h), int(ns * w), 3), 255, dtype=np.uint8)  # init
