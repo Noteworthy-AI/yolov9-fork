@@ -195,7 +195,6 @@ def train(cfg, device, wandb_logger, mldb_logger):
         raise Exception("Invalid model architecture type")
     print(f"Using {train_loader.num_workers * train_cfg.world_size} workers across {train_cfg.world_size} devices")
     print(f'Starting training for {train_cfg.epochs} epochs...')
-    print(f"Model device = {model.device} device type = {model.device_type}, device_ids = {model.device_ids}")
     print_batch_dims = True
 
     # Main Training Loop
