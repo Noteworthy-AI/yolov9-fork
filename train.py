@@ -19,7 +19,7 @@ from torch.optim import lr_scheduler
 from eval import evaluate
 from models.yolo import Model
 from utils.plots import plot_images
-from utils.metrics import fitness
+from utils.object_det_eval import compute_fitness
 from utils.loss_tal import ComputeLoss as ComputeLossGELAN
 from utils.loss_tal_dual import ComputeLoss as ComputeLossPGI
 from utils.dataloaders import create_dataloader
@@ -60,13 +60,24 @@ def train(cfg, device, wandb_logger, mldb_logger):
     print("Initializing model & optimizer")
     ckpt = torch.load(local_w_pth, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
     model_cfg = cfg.get_model_cfg()
-    model = Model(model_cfg, ch=3, nc=nc, anchors=train_cfg.anchors).to(device)  # create
+    model = Model(model_cfg, ch=3, nc=nc, anchors=train_cfg.anchors).to(device)
+    model.hyp = asdict(train_cfg)  # attach hyperparameters to model
+    model.names = names
     exclude = ['anchor'] if not cfg.resume.enabled else []  # exclude keys
     state_dict = ckpt['model'].float().state_dict()  # to FP32
     state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
-    model.load_state_dict(state_dict, strict=False)  # load
+    model.load_state_dict(state_dict, strict=False)      # Load state dictionary
     amp = check_amp(model)
     print(f"- transferred {len(state_dict)}/{len(model.state_dict())} items from {local_w_pth}")
+
+    # Freeze model params
+    freeze = cfg.model.freeze
+    freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]
+    for k, v in model.named_parameters():
+        v.requires_grad = True  # train all layers
+        if any(x in k for x in freeze):
+            print(f"- freezing {k}")
+            v.requires_grad = False
 
     # Initialize W&B logging
     with torch_distributed_zero_first(train_cfg.local_rank):
@@ -75,19 +86,11 @@ def train(cfg, device, wandb_logger, mldb_logger):
             wandb_logger.init(last_epoch)
             cfg_s3_uri = mldb_logger.log_configs(return_s3_uri=True)
             wandb_logger.save_s3_artifact(cfg_s3_uri, cfg.model_name, [], artifact_type="config")
-            train_im_fns = [fn for fn in os.listdir(os.path.join(train_path, "images")) if fn.endswith(".jpg")]
-            val_im_fns = [fn for fn in os.listdir(os.path.join(val_path, "images")) if fn.endswith(".jpg")]
-            train_val_split = {"train": train_im_fns, "val": val_im_fns}
+            train_val_split = {
+                "train": [fn for fn in os.listdir(os.path.join(train_path, "images")) if fn.endswith(".jpg")],
+                "val": [fn for fn in os.listdir(os.path.join(val_path, "images")) if fn.endswith(".jpg")]
+            }
             wandb_logger.save_json_artifact(train_val_split, cfg.model_name, [], "dataset")
-    # Freeze
-    # parameter names to freeze (full or partial)
-    freeze = cfg.model.freeze
-    freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]
-    for k, v in model.named_parameters():
-        v.requires_grad = True  # train all layers
-        if any(x in k for x in freeze):
-            print(f"- freezing {k}")
-            v.requires_grad = False
 
     # Image size
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
@@ -104,13 +107,34 @@ def train(cfg, device, wandb_logger, mldb_logger):
 
     print(f"Training with a total batch size of {total_batch_size} ({batch_size} for {train_cfg.world_size} devices)")
 
+    # Loss Function
+    model_arch_type = cfg.get_model_arch_type()
+    if model_arch_type == "gelan":
+        compute_loss = ComputeLossGELAN(model)  # Loss function for GELAN architecture
+    elif model_arch_type == "pgi":
+        compute_loss = ComputeLossPGI(model)  # Loss function for full YOLOv9 (GELAN+PGI) architecture
+    else:
+        raise Exception("Invalid model architecture type")
+
     # Optimizer
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / total_batch_size), 1)  # accumulate loss before optimizing
     train_cfg.weight_decay *= total_batch_size * accumulate / nbs  # scale weight_decay
     optimizer = smart_optimizer(model, train_cfg.optimizer, train_cfg.lr0, train_cfg.momentum, train_cfg.weight_decay)
 
-    # Learning Rate Scheduler
+    # Model Exponential Moving Average (EMA)
+    ema = ModelEMA(model) if train_cfg.global_rank in {-1, 0} else None
+
+    # Resume & initialize early stopping TODO: verify this, not sure if this is correct
+    early_stopping, stop = EarlyStopping(patience=train_cfg.patience), False
+    start_epoch = 0
+    if cfg.resume.enabled:
+        best_fitness, start_epoch = smart_resume(ckpt, optimizer, ema, train_cfg.epochs)
+        early_stopping.best_fitness = best_fitness
+        early_stopping.best_epoch = start_epoch
+    del ckpt, state_dict
+
+    # Learning Rate Scheduler & Grad Scaler
     if train_cfg.lr_mode == "cos":
         lf = one_cycle(1, train_cfg.lrf, train_cfg.epochs)  # cosine 1->hyp['lrf']
     elif train_cfg.lr_mode == "flat_cos":
@@ -123,16 +147,8 @@ def train(cfg, device, wandb_logger, mldb_logger):
         raise Exception("Invalid LR mode")
 
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
-
-    # Model Exponential Moving Average (EMA)
-    ema = ModelEMA(model) if train_cfg.global_rank in {-1, 0} else None
-
-    # Resume
-    best_fitness, start_epoch = 0.0, 0
-    if cfg.resume.enabled:
-        best_fitness, start_epoch = smart_resume(ckpt, optimizer, ema, train_cfg.epochs)
-
-    del ckpt, state_dict
+    scheduler.last_epoch = start_epoch - 1  # do not move
+    scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
     # DP mode
     if cuda and train_cfg.global_rank == -1 and torch.cuda.device_count() > 1:
@@ -144,36 +160,28 @@ def train(cfg, device, wandb_logger, mldb_logger):
         print("Using SyncBatchNorm for DDP")
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
 
-    # Trainloader
+    # Dataloaders TODO: run experiments on "close mosaic" & "min_items"
     print("Initializing data loaders")
-    # TODO: experimental "close mosaic" & "min_items"
     train_cfg.close_mosaic = 0
     train_cfg.min_items = 0
     train_loader, dataset = create_dataloader(train_cfg, train_path, gs, batch_size, (nc == 1), augment=True,
                                               prefix=colorstr('train: '), shuffle=True)
+    class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
 
-    labels = np.concatenate(dataset.labels, 0)
-    mlc = int(labels[:, 0].max())  # max label class
-    lb_msg = f'Label class {mlc} exceeds nc={nc} in {cfg.dset.train_dataset_name}. Possible class labels are 0-{nc - 1}'
-    assert mlc < nc, lb_msg
-
-    # Process 0
-    with torch_distributed_zero_first(train_cfg.local_rank):
+    with torch_distributed_zero_first(train_cfg.local_rank):  # Val loader (for process 0)
         val_loader, _ = create_dataloader(train_cfg, val_path, gs, batch_size, (nc == 1), pad=0.5, prefix=colorstr('val: '))
 
-        if not cfg.resume.enabled:
-            # TODO: autoanchor???
+        if not cfg.resume.enabled:  # TODO: autoanchor???
             model.half().float()  # pre-reduce anchor precision
 
     # DDP mode
     if cuda and train_cfg.global_rank != -1:
         model = smart_DDP(model, train_cfg)
-
-    # Model attributes (TODO: scale to # of layers?)
-    model.nc = nc  # attach number of classes to model
-    model.hyp = asdict(train_cfg)  # attach hyperparameters to model
-    model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
-    model.names = names
+        device = model.device
+    else:
+        model.device = next(model.parameters()).device
+        model.device_type = next(model.parameters()).device
+        model.device_ids = next(model.parameters()).device
 
     # Start training
     t0 = time.time()
@@ -182,17 +190,6 @@ def train(cfg, device, wandb_logger, mldb_logger):
 
     last_opt_step = -1
     map95s = np.zeros(nc)  # mAP per class
-    val_results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
-    scheduler.last_epoch = start_epoch - 1  # do not move
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
-    stopper, stop = EarlyStopping(patience=train_cfg.patience), False
-    model_arch_type = cfg.get_model_arch_type()
-    if model_arch_type == "gelan":
-        compute_loss = ComputeLossGELAN(model)  # Loss function for GELAN architecture
-    elif model_arch_type == "pgi":
-        compute_loss = ComputeLossPGI(model)  # Loss function for full YOLOv9 (GELAN+PGI) architecture
-    else:
-        raise Exception("Invalid model architecture type")
     print(f"Using {train_loader.num_workers * train_cfg.world_size} workers across {train_cfg.world_size} devices")
     print(f'Starting training for {train_cfg.epochs} epochs...')
     print(f"Model device = {model.device} device type = {model.device_type}, device_ids = {model.device_ids}")
@@ -221,7 +218,6 @@ def train(cfg, device, wandb_logger, mldb_logger):
         progress_header = ('%11s' * 7) % ('Epoch', 'GPU_mem', 'box_loss', 'cls_loss', 'dfl_loss', 'Instances', 'Size')
         progress_str = ""
         pbar = enumerate(train_loader)
-        is_best_model = False 
         if train_cfg.global_rank in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
             metrics_header = ('%11s' * 7) % ( 'Pre', 'Rec', 'mAP@0.5', 'mAP@0.95', 'box_loss', 'obj_loss', 'cls_loss')
@@ -291,12 +287,13 @@ def train(cfg, device, wandb_logger, mldb_logger):
                 # W&B log training image examples
                 if plots and ni < 10:
                     f = os.path.join(save_dir, "train_plot_ims", 'train_batch{}.jpg'.format(ni)) # filename
-                    plot_images(imgs, targets, paths, f)
+                    im_thread = plot_images(imgs, targets, paths, f)
+                    threadjoin_status = im_thread.join()  # prevent hanging thread
                 elif plots and ni == 10 and wandb_logger.wandb:
                     plotted_ims = [wandb_logger.wandb.Image(Image.open(str(fp)), caption=os.path.basename(fp))
                                    for fp in glob.glob(os.path.join(save_dir, "train_plot_ims", 'train*.jpg'))
                                    if os.path.exists(fp)]
-                    wandb_logger.log({"Training input": plotted_ims}, log_type=wandb_logger.tracked_logs.AlwaysLogType)
+                    wandb_logger.log({"train_vis/example_batches": plotted_ims}, log_type=wandb_logger.tracked_logs.AlwaysLogType)
         # end batch ------------------------------------------------------------------------------------------------
 
         # Scheduler
@@ -308,59 +305,59 @@ def train(cfg, device, wandb_logger, mldb_logger):
                 print("Validation for epoch {}".format(epoch))
 
                 ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
-                final_epoch = (epoch + 1 == train_cfg.epochs) or stopper.possible_stop
+                final_epoch = (epoch + 1 == train_cfg.epochs) or early_stopping.possible_stop
                 wandb_logger.current_epoch = epoch
-                val_out = evaluate(cfg, val_loader, batch_size, device, nc, mode="val", half_precision=amp, model=ema.ema,
-                                   plots=True, compute_loss=compute_loss, wandb_logger=wandb_logger)
-                val_results, map95s, t, val_cls_names, val_cls_p, val_cls_r, wandb_logger = val_out
+                val_out = evaluate(model=ema.ema, dataloader=val_loader, eval_mode="val", loss_fn=compute_loss,
+                                   half_precision=amp, wandb_logger=wandb_logger, plot_save_dir=save_dir)
+
+                val_mets, val_losses, val_cls_names, wandb_logger = val_out
 
                 # Calculate fitness score for best model epoch
-                fi = fitness(np.array(val_results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
-                stop = stopper(epoch=epoch, fitness=fi)  # early stop check
-                if fi > best_fitness:
-                    best_fitness = fi
-                    is_best_model = True
-                else:
-                    is_best_model = False
-                
-                wandb_logger.current_epoch_is_best = is_best_model
-
-                # W&B log training & validation results
-                wandb_log_metrics = {
-                    'train/box_loss': mloss[0].cpu().item(),
-                    'train/obj_loss': mloss[1].cpu().item(),
-                    'train/cls_loss': mloss[2].cpu().item(),
-                    'val/mean_precision': list(val_results)[0],
-                    'val/mean_recall': list(val_results)[1],
-                    'val/mAP_0.5': list(val_results)[2],
-                    'val/mAP_0.95': list(val_results)[3],
-                    'val/box_loss': list(val_results)[4],
-                    'val/obj_loss': list(val_results)[5],
-                    'val/cls_loss': list(val_results)[6],
-                    'val/fitness': list(fi)[0],
-                    'lr/0_weights_no_decay': optimizer.param_groups[0]["lr"],
-                    'lr/1_weights_with_decay': optimizer.param_groups[1]["lr"],
-                    'lr/2_biases': optimizer.param_groups[2]["lr"]
+                fitness = compute_fitness(val_mets)  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+                stop = early_stopping(epoch=epoch, fitness=fitness)  # early stop check
+                wandb_logger.current_epoch_is_best = (early_stopping.best_epoch == epoch)
+                val_met_dict = {
+                    'val_metrics/fitness': fitness,
+                    'val_metrics/mean_recall': (val_mets["rec"] * val_mets["support"]).sum() / val_mets["support"].sum(),
+                    'val_metrics/mean_precision': (val_mets["pre"] * val_mets["support"]).sum() / val_mets["support"].sum(),
+                    'val_metrics/mAP_0.5': (val_mets["ap50"] * val_mets["support"]).sum() / val_mets["support"].sum(),
+                    'val_metrics/mAP_0.95': (val_mets["ap95"] * val_mets["support"]).sum() / val_mets["support"].sum(),
+                    'val_metrics/box_loss': val_losses[0],
+                    'val_metrics/obj_loss': val_losses[1],
+                    'val_metrics/cls_loss': val_losses[2],
                 }
 
-                wandb_log_metrics.update({f'val_precision_per_class/{val_cls_names[i]}': val_cls_p[i] for i in range(nc)})
-                wandb_log_metrics.update({f'val_recall_per_class/{val_cls_names[i]}': val_cls_r[i] for i in range(nc)})
                 if wandb_logger.wandb:
                     print("Logging validation results")
-                    print(wandb_log_metrics)
-                    wandb_logger.log(wandb_log_metrics)  # W&B
+                    # W&B log training & validation results
+                    wandb_logger.log({
+                        'train_lrs/0_weights_no_decay': optimizer.param_groups[0]["lr"],
+                        'train_lrs/1_weights_with_decay': optimizer.param_groups[1]["lr"],
+                        'train_lrs/2_biases': optimizer.param_groups[2]["lr"]
+                    })
+                    wandb_logger.log({
+                        'train_losses/box_loss': mloss[0].cpu().item(),
+                        'train_losses/obj_loss': mloss[1].cpu().item(),
+                        'train_losses/cls_loss': mloss[2].cpu().item(),
+                    })
+                    wandb_logger.log(val_met_dict)
+
+                    wandb_logger.log({f'val_class_precision/{val_cls_names[i]}': val_mets.at[i, "pre"]
+                                      for i in range(nc)})
+
+                    wandb_logger.log({f'val_class_recall/{val_cls_names[i]}': val_mets.at[i, "rec"] for i in range(nc)})
                     wandb_logger.end_epoch(train_cfg.save_period > 0 and epoch % train_cfg.save_period == 0)
 
                 # Local metric log for ML DB
-                # Write
                 with open(results_file, 'a') as f:
-                    f.write(progress_str + '%10.4g' * 7 % val_results + '\n')  # append metrics, val_loss
+                    vals = ["mean_precision", "mean_recall", "mAP_0.5", "mAP_0.95", "box_loss", "obj_loss", "cls_loss"]
+                    f.write(progress_str + '%10.4g' * 7 % tuple([val_met_dict["val_metrics/{}".format(el)] for el in vals]) + '\n')
 
                 # Save model
                 if (not train_cfg.nosave) or (final_epoch and not train_cfg.evolve):  # if save
                     ckpt = {
                         'epoch': epoch,
-                        'best_fitness': best_fitness,
+                        'best_fitness': early_stopping.best_fitness,
                         'model': deepcopy(de_parallel(model)).half(),
                         'ema': deepcopy(ema.ema).half(),
                         'updates': ema.updates,
@@ -374,7 +371,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
                     # Save last, best and delete
                     ep_ckpt_save_pth = os.path.join(weights_dir, f'epoch{epoch}.pt')
                     torch.save(ckpt, last_weight_pth)
-                    if is_best_model:
+                    if (early_stopping.best_epoch == epoch):
                         torch.save(ckpt, best_weight_pth)
                     if train_cfg.save_period > 0 and epoch % train_cfg.save_period == 0:
                         torch.save(ckpt, ep_ckpt_save_pth)

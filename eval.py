@@ -1,227 +1,203 @@
 import os
-import cv2
-import glob
 import wandb
 import torch
 import numpy as np
+import pandas as pd
 from tqdm import tqdm
-from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageFile
 
-from utils.general import TQDM_BAR_FORMAT, Profile, scale_boxes, xywh2xyxy, xyxy2xywh
-from utils.general import non_max_suppression as nms
-from utils.metrics import ConfusionMatrix, ap_per_class, box_iou
-from utils.plots import output_to_target, plot_images
+from utils.plots import plot_images
 from utils.torch_utils import smart_inference_mode
+from utils.general import non_max_suppression as nms
+from utils.general import TQDM_BAR_FORMAT, scale_boxes, xywh2xyxy
+from utils.object_det_eval import evaluate_detections, compute_obj_det_eval_metrics, compute_conf_mat
+from utils.object_det_plot import plot_confusion_matrix, plot_mc_curve, plot_pr_curve, format_conf_mat_df
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
-def process_batch(detections, labels, iouv):
-    """
-    Return correct prediction matrix
-    Arguments:
-        detections (array[N, 6]), x1, y1, x2, y2, conf, class
-        labels (array[M, 5]), class, x1, y1, x2, y2
-    Returns:
-        correct (array[N, 10]), for 10 IoU levels
-    """
-    correct = np.zeros((detections.shape[0], iouv.shape[0])).astype(bool)
-    iou = box_iou(labels[:, 1:], detections[:, :4])
-    correct_class = labels[:, 0:1] == detections[:, 5]
-    for i in range(len(iouv)):
-        x = torch.where((iou >= iouv[i]) & correct_class)  # IoU > threshold and classes match
-        if x[0].shape[0]:
-            matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()  # [label, detect, iou]
-            if x[0].shape[0] > 1:
-                matches = matches[matches[:, 2].argsort()[::-1]]
-                matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-                # matches = matches[matches[:, 2].argsort()[::-1]]
-                matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
-            correct[matches[:, 1].astype(int), i] = True
-    return torch.tensor(correct, dtype=torch.bool, device=iouv.device)
+def wandb_im_pred_plot(in_im, in_preds, im_fp, cls_names):
+    box_data = [{"position": {"minX": xyxy[0], "minY": xyxy[1], "maxX": xyxy[2], "maxY": xyxy[3]},
+                 "class_id": int(cls),
+                 "box_caption": "%s %.3f" % (cls_names[cls], conf),
+                 "scores": {"class_score": conf},
+                 "domain": "pixel"} for *xyxy, conf, cls in in_preds.tolist()]
+
+    boxes = {"predictions": {"box_data": box_data, "class_labels": cls_names}}  # inference-space
+    return wandb.Image(in_im, boxes=boxes, caption=os.path.basename(im_fp))
 
 
 @smart_inference_mode()
-def evaluate(cfg, dataloader, batch_size, device, n_classes, mode="test", model=None, conf_thres=0.001, iou_thres=0.7,
-             max_det=300, augment=False, verbose=False, half_precision=True, plots=True, compute_loss=None,
-             wandb_logger=None, n_pred_plot=3):
-
-    plot_save_dir = os.path.join(cfg.get_local_output_dir(exist_ok=True), f"{mode}_plot_ims")
-    os.makedirs(plot_save_dir, exist_ok=True)
-    curr_epoch = wandb_logger.current_epoch
-
+def evaluate(model, dataloader, eval_mode="test", loss_fn=None, nms_conf_thres=0.001, nms_iou_thres=0.7,
+             max_nms_det=300, half_precision=True, plot_save_dir=None, wandb_logger=None, n_pred_plot=3,
+             conf_mat_conf_thresh: float = 0.7, curr_epoch: int = 0):
     # Initialize/load model and set device
-    cuda = device.type != 'cpu'
-    if mode == "val":
-        assert model is not None, "Must specify model object for validation mode"
+    if eval_mode == "val":
+        # Configure model for validation mode
         device, pt, jit, engine = next(model.parameters()).device, True, False, False  # get model device, PyTorch model
+        cuda = device.type != 'cpu'
         half_precision &= cuda  # half precision only supported on CUDA
         model.half() if half_precision else model.float()
-    elif mode == "test":
+        model.eval()
+    elif eval_mode == "test":
         # TODO: setup test mode for standalone eval
-        pass
+        raise Exception("Test mode not implemented")
     else:
         raise Exception("Invalid eval mode")
 
-    # Configure
-    model.eval()
-    iouv = torch.linspace(0.5, 0.95, 10, device=device)  # iou vector for mAP@0.5:0.95
-    niou = iouv.numel()
-
-    seen = 0
-    confusion_matrix = ConfusionMatrix(nc=n_classes)
+    # Format class names
     names = model.names if hasattr(model, 'names') else model.module.names  # get class names
     if isinstance(names, (list, tuple)):  # old format
         names = dict(enumerate(names))
+    n_classes = len(names.keys())
 
-    s = ('%22s' + '%11s' * 6) % ('Class', 'Images', 'Instances', 'P', 'R', 'mAP50', 'mAP50-95')
-    tp, fp, p50, r50, maxf1, mp, mr, map50, ap50, map95, ap95 = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-    dt = Profile(), Profile(), Profile()  # profiling times
-    loss = torch.zeros(3, device=device)
-    jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
-
-    # Logging
-    log_imgs = 0
+    # Initialize counters & start eval loop
+    wb_pred_vis = []  # W&B image logging
     if wandb_logger and wandb_logger.wandb:
-        log_imgs = min(wandb_logger.log_imgs, 100)
+        log_imgs = wandb_logger.log_imgs
+    else:
+        log_imgs = 0
 
-    pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
-    plot_threads = []
-    for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
-        with dt[0]:
-            if cuda:
-                im = im.to(device, non_blocking=True)
-                targets = targets.to(device)
-            im = im.half() if half_precision else im.float()  # uint8 to fp16/32
-            im /= 255  # 0 - 255 to 0.0 - 1.0
-            nb, _, height, width = im.shape  # batch size, channels, height, width
+    loss = torch.zeros(3, device=device)
+    eval_ious = [0.5 + 0.05 * i for i in range(10)]  # iou vector for mAP@0.5:0.95
+
+    # Initialize example im/prediction saving
+    if plot_save_dir is not None:
+        eval_im_save_dir = os.path.join(plot_save_dir, "{}_example_ims".format(eval_mode))
+        eval_met_save_dir = os.path.join(plot_save_dir, "{}_metrics".format(eval_mode))
+        os.makedirs(eval_im_save_dir, exist_ok=True)
+        os.makedirs(eval_met_save_dir, exist_ok=True)
+    else:
+        eval_im_save_dir = None
+        eval_met_save_dir = None
+
+    # Format results DF
+    cols = ["pred_conf", "pred_class"] + ["iou_match_{}".format(round(eval_ious[i], 2)) for i in range(len(eval_ious))]
+    results_df = pd.DataFrame(columns=cols)
+    confusion_mat = np.zeros((n_classes + 1, n_classes + 1)).astype(int)
+    for batch_i, (im, targets, im_paths, im_shapes) in enumerate(tqdm(dataloader, bar_format=TQDM_BAR_FORMAT)):
+        # Format input image
+        if cuda:
+            im = im.to(device, non_blocking=True)
+            targets = targets.to(device)
+        im = im.half() if half_precision else im.float()  # uint8 to fp16/32
+        im /= 255  # 0 - 255 to 0.0 - 1.0
+        nb, _, height, width = im.shape  # batch size, channels, height, width
 
         # Inference
-        with dt[1]:
-            preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
+        preds, train_out = model(im) if loss_fn is not None else (model(im, augment=False), None)
 
         # Loss
-        if compute_loss:
-            loss += compute_loss(train_out, targets)[1]  # box, obj, cls
+        if loss_fn is not None:
+            loss += loss_fn(train_out, targets)[1]  # box, obj, cls
 
         # NMS
         targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
-        with dt[2]:
-            preds = nms(preds, conf_thres, iou_thres, multi_label=True, agnostic=(n_classes == 1), max_det=max_det)
+        preds = nms(preds, nms_conf_thres, nms_iou_thres, multi_label=True, max_det=max_nms_det)
 
-        # Metrics
+        # Process predicted and label bounding boxes
         for si, pred in enumerate(preds):
             labels = targets[targets[:, 0] == si, 1:]
-            nl, npr = labels.shape[0], pred.shape[0]  # number of labels, predictions
-            path, shape = Path(paths[si]), shapes[si][0]
-            correct = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
-            seen += 1
+            nl, npr = labels.shape[0], pred.shape[0]
 
-            if npr == 0:
-                if nl:
-                    stats.append((correct, *torch.zeros((2, 0), device=device), labels[:, 0]))
-                    if plots:
-                        confusion_matrix.process_batch(detections=None, labels=labels[:, 0])
-                continue
+            if npr > 0:
+                preds_i = pred.clone()
+                scaled_pred_bboxes = scale_boxes(im[si].shape[1:], preds_i[:, :4], im_shapes[si][0], im_shapes[si][1])
+                preds_i[:, :4] = scaled_pred_bboxes
+            else:
+                preds_i = torch.zeros((0, 6), device=device)
 
-            # Predictions
-            if n_classes == 1:
-                pred[:, 5] = 0
-            predn = pred.clone()
-            scale_boxes(im[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
+            if nl > 0:
+                raw_gt_bboxes = xywh2xyxy(labels[:, 1:5])
+                scaled_gt_bboxes = scale_boxes(im[si].shape[1:], raw_gt_bboxes, im_shapes[si][0], im_shapes[si][1])
+                gt_i = torch.cat((labels[:, 0:1], scaled_gt_bboxes), 1)  # native-space labels
+            else:
+                gt_i = torch.zeros((0, 5), device=device)
 
-            # W&B log validation images + predictions
-            if (len(wandb_images) < log_imgs):
-                box_data = [{"position": {"minX": xyxy[0], "minY": xyxy[1], "maxX": xyxy[2], "maxY": xyxy[3]},
-                             "class_id": int(cls),
-                             "box_caption": "%s %.3f" % (names[cls], conf),
-                             "scores": {"class_score": conf},
-                             "domain": "pixel"} for *xyxy, conf, cls in pred.tolist()]
-                boxes = {"predictions": {"box_data": box_data, "class_labels": names}}  # inference-space
-                wandb_images.append(wandb_logger.wandb.Image(im[si], boxes=boxes, caption=path.name))
+            # Compute image-wise metrics
+            im_result_df = evaluate_detections(preds_i, gt_i, eval_ious)
+            if len(results_df) == 0:
+                results_df = im_result_df.copy()
+            else:
+                results_df = pd.concat((results_df, im_result_df)).reset_index(drop=True).copy()
 
-            # Evaluate
-            if nl:
-                tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
-                scale_boxes(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
-                labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
-                correct = process_batch(predn, labelsn, iouv)
-                if plots:
-                    confusion_matrix.process_batch(predn, labelsn)
-            stats.append((correct, pred[:, 4], pred[:, 5], labels[:, 0]))  # (correct, conf, pcls, tcls)
+            # Compute image confusion matrix
+            im_conf_mat = compute_conf_mat(preds_i, gt_i, conf_mat_conf_thresh, conf_mat_conf_thresh, n_classes)
+            confusion_mat += im_conf_mat
 
-        # Plot images
-        if plots and batch_i < n_pred_plot:
-            lb_plot_path = Path(plot_save_dir) / f'ex_b{batch_i}_labels.png'
-            pred_plot_path = Path(plot_save_dir) / f'ex_b{batch_i}_preds.png'
-            lb_plot_thread = plot_images(im, targets, paths, lb_plot_path, names=names)   # labels
-            pred_plot_thread = plot_images(im, targets, paths, pred_plot_path, names=names)  # preds
-            threadjoin_status = [thread.join() for thread in [lb_plot_thread, pred_plot_thread]]
+            # Plot eval predictions on images for W&B
+            if len(wb_pred_vis) < log_imgs:
+                wb_im = wandb_im_pred_plot(im[si], pred, im_paths[si], names)
+                wb_pred_vis.append(wb_im)
 
-    # Compute metrics
-    stats = [torch.cat(x, 0).cpu().numpy() for x in zip(*stats)]  # to numpy
-    if len(stats) and stats[0].any():
-        tp, fp, p50, r50, maxf1, ap, ap_class = ap_per_class(*stats, plot=plots, save_dir=plot_save_dir, names=names)
-        ap50, ap95 = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
-        mp, mr, map50, map95 = p50.mean(), r50.mean(), ap50.mean(), ap95.mean()
-    nt = np.bincount(stats[3].astype(int), minlength=n_classes)  # number of targets per class
+            # Plot images
+            if plot_save_dir is not None and batch_i < n_pred_plot:
+                lb_plot_path = os.path.join(eval_im_save_dir, 'ex_b{}_labels.png'.format(batch_i))
+                pred_plot_path = os.path.join(eval_im_save_dir, 'ex_b{}_preds.png'.format(batch_i))
+                lb_plot_thread = plot_images(im, targets, im_paths, lb_plot_path, names=names)  # labels
+                pred_plot_thread = plot_images(im, targets, im_paths, pred_plot_path, names=names)  # preds
+                threadjoin_status = [thread.join() for thread in [lb_plot_thread, pred_plot_thread]]
 
-    # Print results
-    pf = '%22s' + '%11i' * 2 + '%11.3g' * 4  # print format
-    print(pf % ('all', seen, nt.sum(), mp, mr, map50, map95))
-    if nt.sum() == 0:
-        print(f'WARNING ⚠️ no labels found in {mode} set, can not compute metrics without labels')
+    # Compute aggregate metrics
+    gt_class_dets = confusion_mat[:, :-1].sum(axis=0).astype(int)
+    cw_metrics, mc_pts = compute_obj_det_eval_metrics(results_df, gt_class_dets, metric_iou_thresh=conf_mat_conf_thresh,
+                                                      min_conf_thresh=nms_conf_thres, class_names=names)
 
-    # Print results per class
-    if (verbose or (n_classes < 50 and mode != "val")) and n_classes > 1 and len(stats):
-        for i, c in enumerate(ap_class):
-            print(pf % (names[c], seen, nt[c], p50[i], r50[i], ap50[i], ap95[i]))
-
-    # Print speeds
-    t = tuple(x.t / seen * 1E3 for x in dt)  # speeds per image
-    if mode != "val":
-        shape = (batch_size, 3, cfg.training.img_size, cfg.training.img_size)
-        print(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {shape}' % t)
-
-    if plots:
+    if plot_save_dir is not None:
         # Plot confusion matrix
-        confusion_matrix.plot(save_dir=plot_save_dir, names=list(names.values()))
+        conf_mat_df = format_conf_mat_df(confusion_mat, names, normalize=True)
+        conf_thread = plot_confusion_matrix(conf_mat_df,
+                                            save_path=os.path.join(eval_met_save_dir, "confusion_matrix.png"))
 
-        # W&B log class-wise precision
+        # Plot metric curves
+        prcurve_thread = plot_pr_curve(mc_pts["px"], mc_pts["py"], cw_metrics["ap50"].to_numpy(),
+                                       os.path.join(eval_met_save_dir, "pr_curve.png"), names)
+        f1fp = os.path.join(eval_met_save_dir, "f1_curve.png")
+        f1curve_thread = plot_mc_curve(mc_pts["px"], mc_pts["f1"], f1fp, names, ylabel='F1')
+        prefp = os.path.join(eval_met_save_dir, "precision_curve.png")
+        pcurve_thread = plot_mc_curve(mc_pts["px"], mc_pts["pre"], prefp, names, ylabel='Precision')
+        recfp = os.path.join(eval_met_save_dir, "recall_curve.png")
+        rcurve_thread = plot_mc_curve(mc_pts["px"], mc_pts["rec"], recfp, names, ylabel='Recall')
+        im_threads = [conf_thread, prcurve_thread, f1curve_thread, pcurve_thread, rcurve_thread]
+        threadjoin_status = [thread.join() for thread in im_threads]
+
+        # Log to W&B
         if wandb_logger and wandb_logger.wandb:
-            if isinstance(maxf1, np.ndarray):
-                maxf1 = maxf1.mean()
-            rounded_max_f1 = round(maxf1, 3)
-            precision_recall_table = wandb.Table(
-                columns=['Category', f'Precision_@{rounded_max_f1}', f'Recall_@{rounded_max_f1}'],
-                data=[[names[c], p50[i], r50[i]] for i, c in enumerate(ap_class)])
-            wandb_logger.log({f'pr_tables/{mode}-split': precision_recall_table})
+            # Log eval batch examples
+            wb_ex_ims = [wandb.Image(Image.open(os.path.join(eval_im_save_dir, fn)),
+                                     caption='ep{}_{}'.format(curr_epoch, os.path.basename(fn)))
+                         for fn in os.listdir(eval_im_save_dir)]
+            wandb_logger.log({'{}_vis/example_batches'.format(eval_mode): wb_ex_ims})
+            # Log curves & confusion matrices
+            m_fns = ["confusion_matrix.png", "pr_curve.png", "f1_curve.png", "precision_curve.png", "recall_curve.png"]
+            m_ims = [os.path.join(eval_met_save_dir, im_name) for im_name in m_fns]
+            wb_m_ims = [wandb.Image(Image.open(f), caption='ep{}_{}'.format(curr_epoch, os.path.basename(f)))
+                        for f in m_ims]
 
-        m_fns = ["confusion_matrix.png", "PR_curve.png", "F1_curve.png", "P_curve.png", "R_curve.png"]
-        m_ims = [os.path.join(plot_save_dir, im_name) for im_name in m_fns]
-        wb_m_ims = [wandb_logger.wandb.Image(Image.open(f), caption='ep{}_{}'.format(curr_epoch, os.path.basename(f))) for f in m_ims]
-        wandb_logger.log({'{}-metric-plots'.format(mode): wb_m_ims}, log_type=wandb_logger.tracked_logs.BestCandidateLogType)
+            wandb_logger.log({'{}_metric_plots/{}'.format(eval_mode, m_fns[i]): wb_m_ims[i] for i in range(len(m_ims))},
+                             log_type=wandb_logger.tracked_logs.BestCandidateLogType)
 
-        if wandb_images:
-            wandb_logger.log({"Predictions per epoch (val set)/Images": wandb_images}, log_type=wandb_logger.tracked_logs.EpochLogType)
+            # Log prediction examples
+            if wb_pred_vis:
+                wandb_logger.log({"{}_images/prediction_examples".format(eval_mode): wb_pred_vis},
+                                 log_type=wandb_logger.tracked_logs.EpochLogType)
 
+            # Log eval summary: table with classwise metrics, bar plot with recall values
+            out_metric_df = cw_metrics.copy()
+            out_metric_df.index = cw_metrics["class_name"]
+            wb_metrics_table = wandb.Table(dataframe=out_metric_df.drop(columns=["class_name"]))
+            bar_chart = wandb.plot.bar(
+                wb_metrics_table,
+                label="class_name",
+                value="rec",
+                title="Validation Recall per Class"
+            )
+            wandb_logger.log({
+                "{}_summary/recall_chart".format(eval_mode): bar_chart,
+                "{}_summary/metric_table".format(eval_mode): wb_metrics_table
+            }, log_type=wandb_logger.tracked_logs.BestCandidateLogType)
 
-    # Per-class mAP@0.95
-    map95s = np.zeros(n_classes)
-    for i, c in enumerate(ap_class):
-        map95s[c] = ap95[i]
-
-    # Return validation precision and recall per class
-    ap_class_list = list(ap_class)
-    class_names, classes_precision, classes_recall = [], [], []
-    for i in range(len(names)):
-        if i in ap_class_list:
-            classes_precision.append(p50[ap_class_list.index(i)])
-            classes_recall.append(r50[ap_class_list.index(i)])
-        else:
-            classes_precision.append(0.0)
-            classes_recall.append(0.0)
-
+    out_losses = (loss.cpu() / len(dataloader)).tolist()
     model.float()  # for training
 
-    formatted_results = (mp, mr, map50, map95, *(loss.cpu() / len(dataloader)).tolist())
-    return formatted_results, map95s, t, names, classes_precision, classes_recall, wandb_logger
+    return cw_metrics, out_losses, names, wandb_logger
