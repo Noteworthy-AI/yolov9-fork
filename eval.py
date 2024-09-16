@@ -183,19 +183,16 @@ def evaluate(model, dataloader, eval_mode="test", loss_fn=None, nms_conf_thres=0
                                  log_type=wandb_logger.tracked_logs.EpochLogType)
 
             # Log eval summary: table with classwise metrics, bar plot with recall values
-            out_metric_df = cw_metrics.copy()
-            out_metric_df.index = cw_metrics["class_name"]
-            wb_metrics_table = wandb.Table(dataframe=out_metric_df.drop(columns=["class_name"]))
+            wb_metrics_table = wandb.Table(dataframe=cw_metrics)
             bar_chart = wandb.plot.bar(
                 wb_metrics_table,
                 label="class_name",
                 value="rec",
                 title="Validation Recall per Class"
             )
-            wandb_logger.log({
-                "{}_summary/recall_chart".format(eval_mode): bar_chart,
-                "{}_summary/metric_table".format(eval_mode): wb_metrics_table
-            }, log_type=wandb_logger.tracked_logs.BestCandidateLogType)
+            wandb_logger.log({"{}_summary/metric_table".format(eval_mode): wb_metrics_table})
+
+            wandb_logger.log({"{}_summary/recall_chart".format(eval_mode): bar_chart})
 
     out_losses = (loss.cpu() / len(dataloader)).tolist()
     model.float()  # for training

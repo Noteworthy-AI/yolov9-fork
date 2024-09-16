@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 
 
-def compute_obj_det_eval_metrics(in_result_df: pd.DataFrame, in_gt_class_labels: np.ndarray, class_names: str=None,
+def compute_obj_det_eval_metrics(in_result_df: pd.DataFrame, in_gt_class_labels: np.ndarray, class_names: list[str]=None,
                                  metric_iou_thresh: float = 0.7, min_conf_thresh: float = 0.001):
 
     # Initialive IOU values
@@ -17,6 +17,8 @@ def compute_obj_det_eval_metrics(in_result_df: pd.DataFrame, in_gt_class_labels:
     px, py = np.linspace(min_conf_thresh, 1, 1000), []  # for plotting
     aps = np.zeros((nc, len(iou_vals)))
     p, r, interp_confs = np.zeros((nc, 1000)), np.zeros((nc, 1000)), np.zeros((nc, 1000))
+    if class_names is None:
+        class_names = [i for i in range(nc)]
 
     # Compute object detection eval metrics for each class
     for class_idx in range(nc):
@@ -32,8 +34,12 @@ def compute_obj_det_eval_metrics(in_result_df: pd.DataFrame, in_gt_class_labels:
         # Recall
         cls_rec = tps / (n_cls_l + 1e-7)
         cls_pre = tps/ (tps + fps + 1e-7)
-        r[class_idx] = np.interp(-px, -confs, cls_rec[:, iou_idx], left=0)
-        p[class_idx] = np.interp(-px, -confs, cls_pre[:, iou_idx], left=1)
+        if len(confs) > 0:
+            r[class_idx] = np.interp(-px, -confs, cls_rec[:, iou_idx], left=0)
+            p[class_idx] = np.interp(-px, -confs, cls_pre[:, iou_idx], left=1)
+        else:
+            r[class_idx] = np.zeros((1000,))
+            p[class_idx] = np.zeros((1000,))
 
         # AP from recall-precision curve
         for j in range(len(iou_vals)):
@@ -55,6 +61,7 @@ def compute_obj_det_eval_metrics(in_result_df: pd.DataFrame, in_gt_class_labels:
     max_f1_idxes = smoothed_f1.argmax(1)
 
     classwise_metrics = pd.DataFrame({
+        "class_name": class_names,
         "support": in_gt_class_labels,
         "opt_conf": np.asarray([px[max_f1_idxes[i]] for i in range(len(max_f1_idxes))]),
         "f1": np.asarray([f1[i, max_f1_idxes[i]] for i in range(len(max_f1_idxes))]),
@@ -63,8 +70,6 @@ def compute_obj_det_eval_metrics(in_result_df: pd.DataFrame, in_gt_class_labels:
         "ap50": aps[:, 0],
         "ap95": aps.mean(1)
     })
-    if class_names is not None:
-        classwise_metrics["class_name"] = class_names
 
     return classwise_metrics, metric_curves
 
