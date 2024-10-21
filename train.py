@@ -85,7 +85,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
             last_epoch = ckpt.get('epoch') if cfg.resume.enabled else None
             wandb_logger.init(last_epoch)
             cfg_s3_uri = mldb_logger.log_configs(return_s3_uri=True)
-            wandb_logger.save_s3_artifact(cfg_s3_uri, cfg.model_name, [], artifact_type="config")
+            wandb_logger.save_s3_artifact(cfg_s3_uri, [], artifact_type="config")
             train_val_split = {
                 "train": [fn for fn in os.listdir(os.path.join(train_path, "images")) if fn.endswith(".jpg")],
                 "val": [fn for fn in os.listdir(os.path.join(val_path, "images")) if fn.endswith(".jpg")]
@@ -293,7 +293,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
                     plotted_ims = [wandb_logger.wandb.Image(Image.open(str(fp)), caption=os.path.basename(fp))
                                    for fp in glob.glob(os.path.join(save_dir, "train_plot_ims", 'train*.jpg'))
                                    if os.path.exists(fp)]
-                    wandb_logger.log({"train_vis/example_batches": plotted_ims}, log_type=wandb_logger.tracked_logs.AlwaysLogType)
+                    wandb_logger.log({"train_vis/example_batches": plotted_ims})
         # end batch ------------------------------------------------------------------------------------------------
 
         # Scheduler
@@ -306,7 +306,6 @@ def train(cfg, device, wandb_logger, mldb_logger):
 
                 ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
                 final_epoch = (epoch + 1 == train_cfg.epochs) or early_stopping.possible_stop
-                wandb_logger.current_epoch = epoch
                 val_out = evaluate(model=ema.ema, dataloader=val_loader, eval_mode="val", loss_fn=compute_loss,
                                    half_precision=amp, wandb_logger=wandb_logger, plot_save_dir=save_dir)
 
@@ -315,7 +314,6 @@ def train(cfg, device, wandb_logger, mldb_logger):
                 # Calculate fitness score for best model epoch
                 fitness = compute_fitness(val_mets)  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
                 stop = early_stopping(epoch=epoch, fitness=fitness)  # early stop check
-                wandb_logger.current_epoch_is_best = (early_stopping.best_epoch == epoch)
                 val_met_dict = {
                     'val_metrics/fitness': fitness,
                     'val_metrics/mean_recall': (val_mets["rec"] * val_mets["support"]).sum() / val_mets["support"].sum(),
@@ -328,8 +326,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
                 }
 
                 if wandb_logger.wandb:
-                    print("Logging validation results")
-                    # W&B log training & validation results
+                    # W&B log training results
                     wandb_logger.log({
                         'train_lrs/0_weights_no_decay': optimizer.param_groups[0]["lr"],
                         'train_lrs/1_weights_with_decay': optimizer.param_groups[1]["lr"],
@@ -340,13 +337,14 @@ def train(cfg, device, wandb_logger, mldb_logger):
                         'train_losses/obj_loss': mloss[1].cpu().item(),
                         'train_losses/cls_loss': mloss[2].cpu().item(),
                     })
-                    wandb_logger.log(val_met_dict)
 
+                    # W&B log validation metrics
+                    wandb_logger.log(val_met_dict)
                     wandb_logger.log({f'val_class_precision/{val_cls_names[i]}': val_mets.at[i, "pre"]
                                       for i in range(nc)})
-
-                    wandb_logger.log({f'val_class_recall/{val_cls_names[i]}': val_mets.at[i, "rec"] for i in range(nc)})
-                    wandb_logger.end_epoch(train_cfg.save_period > 0 and epoch % train_cfg.save_period == 0)
+                    wandb_logger.log({f'val_class_recall/{val_cls_names[i]}': val_mets.at[i, "rec"]
+                                      for i in range(nc)})
+                    wandb_logger.end_epoch(n_epoch=epoch, is_best=(early_stopping.best_epoch == epoch))
 
                 # Local metric log for ML DB
                 with open(results_file, 'a') as f:
@@ -381,7 +379,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
                         if (not final_epoch):
                             s3_uri = mldb_logger.log_checkpoint(ckpt, ep_ckpt_save_pth, return_s3_uri = True)
                             if wandb_logger.wandb:
-                                wandb_logger.save_s3_artifact(s3_uri, cfg.model_name, aliases = [f"epoch-{epoch}"])
+                                wandb_logger.save_s3_artifact(s3_uri, aliases=[f"epoch-{epoch}"])
                     del ckpt
 
         # EarlyStopping

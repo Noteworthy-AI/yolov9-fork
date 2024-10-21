@@ -30,7 +30,7 @@ def wandb_im_pred_plot(in_im, in_preds, im_fp, cls_names):
 @smart_inference_mode()
 def evaluate(model, dataloader, eval_mode="test", loss_fn=None, nms_conf_thres=0.001, nms_iou_thres=0.7,
              max_nms_det=300, half_precision=True, plot_save_dir=None, wandb_logger=None, n_pred_plot=3,
-             conf_mat_conf_thresh: float = 0.7, curr_epoch: int = 0):
+             conf_mat_conf_thresh: float = 0.4, curr_epoch: int = 0):
     # Initialize/load model and set device
     if eval_mode == "val":
         # Configure model for validation mode
@@ -63,12 +63,9 @@ def evaluate(model, dataloader, eval_mode="test", loss_fn=None, nms_conf_thres=0
 
     # Initialize example im/prediction saving
     if plot_save_dir is not None:
-        eval_im_save_dir = os.path.join(plot_save_dir, "{}_example_ims".format(eval_mode))
         eval_met_save_dir = os.path.join(plot_save_dir, "{}_metrics".format(eval_mode))
-        os.makedirs(eval_im_save_dir, exist_ok=True)
         os.makedirs(eval_met_save_dir, exist_ok=True)
     else:
-        eval_im_save_dir = None
         eval_met_save_dir = None
 
     # Format results DF
@@ -130,17 +127,9 @@ def evaluate(model, dataloader, eval_mode="test", loss_fn=None, nms_conf_thres=0
                 wb_im = wandb_im_pred_plot(im[si], pred, im_paths[si], names)
                 wb_pred_vis.append(wb_im)
 
-            # Plot images
-            if plot_save_dir is not None and batch_i < n_pred_plot:
-                lb_plot_path = os.path.join(eval_im_save_dir, 'ex_b{}_labels.png'.format(batch_i))
-                pred_plot_path = os.path.join(eval_im_save_dir, 'ex_b{}_preds.png'.format(batch_i))
-                lb_plot_thread = plot_images(im, targets, im_paths, lb_plot_path, names=names)  # labels
-                pred_plot_thread = plot_images(im, targets, im_paths, pred_plot_path, names=names)  # preds
-                threadjoin_status = [thread.join() for thread in [lb_plot_thread, pred_plot_thread]]
-
     # Compute aggregate metrics
     gt_class_dets = confusion_mat[:, :-1].sum(axis=0).astype(int)
-    cw_metrics, mc_pts = compute_obj_det_eval_metrics(results_df, gt_class_dets, metric_iou_thresh=conf_mat_conf_thresh,
+    cw_metrics, mc_pts = compute_obj_det_eval_metrics(results_df, gt_class_dets, metric_iou_thresh=nms_iou_thres,
                                                       min_conf_thresh=nms_conf_thres, class_names=names)
 
     if plot_save_dir is not None:
@@ -163,24 +152,19 @@ def evaluate(model, dataloader, eval_mode="test", loss_fn=None, nms_conf_thres=0
 
         # Log to W&B
         if wandb_logger and wandb_logger.wandb:
-            # Log eval batch examples
-            wb_ex_ims = [wandb.Image(Image.open(os.path.join(eval_im_save_dir, fn)),
-                                     caption='ep{}_{}'.format(curr_epoch, os.path.basename(fn)))
-                         for fn in os.listdir(eval_im_save_dir)]
-            wandb_logger.log({'{}_vis/example_batches'.format(eval_mode): wb_ex_ims})
+            # TODO: reimplmement pred+gt plots, this isn't plotting well rn
             # Log curves & confusion matrices
             m_fns = ["confusion_matrix.png", "pr_curve.png", "f1_curve.png", "precision_curve.png", "recall_curve.png"]
             m_ims = [os.path.join(eval_met_save_dir, im_name) for im_name in m_fns]
             wb_m_ims = [wandb.Image(Image.open(f), caption='ep{}_{}'.format(curr_epoch, os.path.basename(f)))
                         for f in m_ims]
 
-            wandb_logger.log({'{}_metric_plots/{}'.format(eval_mode, m_fns[i]): wb_m_ims[i] for i in range(len(m_ims))},
-                             log_type=wandb_logger.tracked_logs.BestCandidateLogType)
+            wandb_logger.log({'{}_metric_plots/{}'.format(eval_mode, m_fns[i]): wb_m_ims[i] for i in range(len(m_ims))}, 
+                             best_only=True)
 
             # Log prediction examples
             if wb_pred_vis:
-                wandb_logger.log({"{}_images/prediction_examples".format(eval_mode): wb_pred_vis},
-                                 log_type=wandb_logger.tracked_logs.EpochLogType)
+                wandb_logger.log({"{}_images/prediction_examples".format(eval_mode): wb_pred_vis})
 
             # Log eval summary: table with classwise metrics, bar plot with recall values
             wb_metrics_table = wandb.Table(dataframe=cw_metrics)
@@ -190,9 +174,8 @@ def evaluate(model, dataloader, eval_mode="test", loss_fn=None, nms_conf_thres=0
                 value="rec",
                 title="Validation Recall per Class"
             )
-            wandb_logger.log({"{}_summary/metric_table".format(eval_mode): wb_metrics_table})
-
-            wandb_logger.log({"{}_summary/recall_chart".format(eval_mode): bar_chart})
+            wandb_logger.log({"{}_summary/metric_table".format(eval_mode): wb_metrics_table}, best_only=True)
+            wandb_logger.log({"{}_summary/recall_chart".format(eval_mode): bar_chart}, best_only=True)
 
     out_losses = (loss.cpu() / len(dataloader)).tolist()
     model.float()  # for training

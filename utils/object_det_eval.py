@@ -3,10 +3,10 @@ import numpy as np
 import pandas as pd
 
 
-def compute_obj_det_eval_metrics(in_result_df: pd.DataFrame, in_gt_class_labels: np.ndarray, class_names: list[str]=None,
+def compute_obj_det_eval_metrics(in_result_df: pd.DataFrame, in_gt_class_labels: np.ndarray, class_names: dict = None,
                                  metric_iou_thresh: float = 0.7, min_conf_thresh: float = 0.001):
 
-    # Initialive IOU values
+    # Initialize IOU values
     iou_vals = [float(el.replace('iou_match_', "")) for el in in_result_df.columns if el.startswith('iou_match_')]
     iou_idx = np.abs(np.asarray(iou_vals) - metric_iou_thresh).argmin()
     err_msg = "Invalid input IOU threshold (must be in existing IOU buckets, was instead {}".format(metric_iou_thresh)
@@ -19,12 +19,14 @@ def compute_obj_det_eval_metrics(in_result_df: pd.DataFrame, in_gt_class_labels:
     p, r, interp_confs = np.zeros((nc, 1000)), np.zeros((nc, 1000)), np.zeros((nc, 1000))
     if class_names is None:
         class_names = [i for i in range(nc)]
+    else:
+        class_names = [class_names[i] for i in range(nc)]
 
     # Compute object detection eval metrics for each class
     for class_idx in range(nc):
         n_cls_l = in_gt_class_labels[class_idx]
         class_preds = in_result_df.loc[in_result_df["pred_class"] == class_idx]
-        sorted_class_df = class_preds.sort_values(by="pred_conf").copy().reset_index(drop=True)
+        sorted_class_df = class_preds.sort_values(by="pred_conf", ascending=False).copy().reset_index(drop=True)
         pred_arr = sorted_class_df[[el for el in sorted_class_df.columns if el.startswith("iou_match_")]].values
         # N_preds x N_metrics x N_iouvals
         confs = sorted_class_df["pred_conf"].values
@@ -33,7 +35,7 @@ def compute_obj_det_eval_metrics(in_result_df: pd.DataFrame, in_gt_class_labels:
 
         # Recall
         cls_rec = tps / (n_cls_l + 1e-7)
-        cls_pre = tps/ (tps + fps + 1e-7)
+        cls_pre = tps / (tps + fps + 1e-7)
         if len(confs) > 0:
             r[class_idx] = np.interp(-px, -confs, cls_rec[:, iou_idx], left=0)
             p[class_idx] = np.interp(-px, -confs, cls_pre[:, iou_idx], left=1)
@@ -70,6 +72,7 @@ def compute_obj_det_eval_metrics(in_result_df: pd.DataFrame, in_gt_class_labels:
         "ap50": aps[:, 0],
         "ap95": aps.mean(1)
     })
+    classwise_metrics.sort_values(by="rec").reset_index(drop=True)
 
     return classwise_metrics, metric_curves
 
@@ -101,11 +104,6 @@ def evaluate_detections(detections: torch.Tensor, labels: torch.Tensor, in_ious:
         if cls_iou_matches[0].shape[0] > 0:
             unique_cls_iou_matches = get_unique_matches(cls_iou_matches, all_ious)
             results_df.loc[unique_cls_iou_matches[:, 1], 'iou_match_{}'.format(round(in_ious[i], 2))] = 1
-
-            # Check for previous weird case
-            for j in range(i):
-                assert results_df.loc[unique_cls_iou_matches[:, 1], 'iou_match_{}'.format(round(in_ious[j], 2))].all()
-
     return results_df
 
 
@@ -125,7 +123,6 @@ def compute_conf_mat(detections, labels, iou_thresh, conf_thresh, n_classes) -> 
     conf_pred_bboxes = confident_preds[:, :4]
     gt_bboxes = labels[:, 1:]
     all_ious = batch_torch_bbox_iou(gt_bboxes, conf_pred_bboxes).cpu().numpy()
-    all_class_matches = (labels[:, 0:1] == detections[:, 5]).cpu().numpy()
     # Compute confusion matrix for this set of detections
     iou_matches = np.where((all_ious >= iou_thresh))
     unique_iou_matches = get_unique_matches(iou_matches, all_ious)
