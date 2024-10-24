@@ -17,10 +17,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from utils.general import LOGGER, check_version, colorstr, file_date, git_describe
 from utils.lion import Lion
 
-LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
-RANK = int(os.getenv('RANK', -1))
-WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
-
 try:
     import thop  # for FLOPs computation
 except ImportError:
@@ -48,15 +44,15 @@ def smartCrossEntropyLoss(label_smoothing=0.0):
     return nn.CrossEntropyLoss()
 
 
-def smart_DDP(model):
+def smart_DDP(model, cfg):
     # Model DDP creation with checks
     assert not check_version(torch.__version__, '1.12.0', pinned=True), \
         'torch==1.12.0 torchvision==0.13.0 DDP training is not supported due to a known issue. ' \
         'Please upgrade or downgrade torch to use DDP. See https://github.com/ultralytics/yolov5/issues/8395'
     if check_version(torch.__version__, '1.11.0'):
-        return DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK, static_graph=True)
+        return DDP(model, device_ids=[cfg.local_rank], output_device=cfg.local_rank, static_graph=True)
     else:
-        return DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK)
+        return DDP(model, device_ids=[cfg.local_rank], output_device=cfg.local_rank)
 
 
 def reshape_classifier_output(model, n=1000):
@@ -103,7 +99,7 @@ def device_count():
 
 def select_device(device='', batch_size=0, newline=True):
     # device = None or 'cpu' or 0 or '0' or '0,1,2,3'
-    s = f'YOLOv5 🚀 {git_describe() or file_date()} Python-{platform.python_version()} torch-{torch.__version__} '
+    s = f'YOLOv9 🚀 {git_describe() or file_date()} Python-{platform.python_version()} torch-{torch.__version__} '
     device = str(device).strip().lower().replace('cuda:', '').replace('none', '')  # to string, 'cuda:0' to '0'
     cpu = device == 'cpu'
     mps = device == 'mps'  # Apple Metal Performance Shaders (MPS)
@@ -287,7 +283,7 @@ def model_info(model, verbose=False, imgsz=640):
         fs = ''
 
     name = Path(model.yaml_file).stem.replace('yolov5', 'YOLOv5') if hasattr(model, 'yaml_file') else 'Model'
-    LOGGER.info(f"{name} summary: {len(list(model.modules()))} layers, {n_p} parameters, {n_g} gradients{fs}")
+    print(f"{name} summary: {len(list(model.modules()))} layers, {n_p} parameters, {n_g} gradients{fs}")
 
 
 def scale_img(img, ratio=1.0, same_shape=False, gs=32):  # img(16,3,256,416)
@@ -455,24 +451,21 @@ def smart_hub_load(repo='ultralytics/yolov5', model='yolov5s', **kwargs):
         return torch.hub.load(repo, model, force_reload=True, **kwargs)
 
 
-def smart_resume(ckpt, optimizer, ema=None, weights='yolov5s.pt', epochs=300, resume=True):
+def smart_resume(ckpt, optimizer, ema, epochs):
     # Resume training from a partially trained checkpoint
     best_fitness = 0.0
-    start_epoch = ckpt['epoch'] + 1
-    if ckpt['optimizer'] is not None:
+    start_epoch = 0
+    if ckpt.get('epoch') and isinstance(ckpt.get('epoch'), int):
+        start_epoch = ckpt['epoch'] + 1
+    if optimizer and ckpt.get('optimizer') and ckpt.get('best_fitness'):
         optimizer.load_state_dict(ckpt['optimizer'])  # optimizer
         best_fitness = ckpt['best_fitness']
-    if ema and ckpt.get('ema'):
+    if ema and ckpt.get('ema') and ckpt.get('updates'):
         ema.ema.load_state_dict(ckpt['ema'].float().state_dict())  # EMA
         ema.updates = ckpt['updates']
-    if resume:
-        assert start_epoch > 0, f'{weights} training to {epochs} epochs is finished, nothing to resume.\n' \
-                                f"Start a new training without --resume, i.e. 'python train.py --weights {weights}'"
-        LOGGER.info(f'Resuming training from {weights} from epoch {start_epoch} to {epochs} total epochs')
     if epochs < start_epoch:
-        LOGGER.info(f"{weights} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {epochs} more epochs.")
-        epochs += ckpt['epoch']  # finetune additional epochs
-    return best_fitness, start_epoch, epochs
+        assert start_epoch < epochs, f"Start epoch {start_epoch} from checkpoint cannot be higher than total epochs {epochs}."
+    return best_fitness, start_epoch
 
 
 class EarlyStopping:

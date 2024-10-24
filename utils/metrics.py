@@ -1,3 +1,4 @@
+import os
 import math
 import warnings
 from pathlib import Path
@@ -78,11 +79,15 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names
     names = [v for k, v in names.items() if k in unique_classes]  # list: only classes that have data
     names = dict(enumerate(names))  # to dict
     if plot:
-        plot_pr_curve(px, py, ap, Path(save_dir) / f'{prefix}PR_curve.png', names)
-        plot_mc_curve(px, f1, Path(save_dir) / f'{prefix}F1_curve.png', names, ylabel='F1')
-        plot_mc_curve(px, p, Path(save_dir) / f'{prefix}P_curve.png', names, ylabel='Precision')
-        plot_mc_curve(px, r, Path(save_dir) / f'{prefix}R_curve.png', names, ylabel='Recall')
-
+        pr_curve_path = os.path.join(save_dir, f'{prefix}PR_curve.png')
+        f1_curve_path = os.path.join(save_dir, f'{prefix}F1_curve.png')
+        p_curve_path = os.path.join(save_dir, f'{prefix}P_curve.png')
+        r_curve_path = os.path.join(save_dir, f'{prefix}R_curve.png')
+        pr_thread = plot_pr_curve(px, py, ap, Path(pr_curve_path), names)
+        f1_thread = plot_mc_curve(px, f1, Path(f1_curve_path), names, ylabel='F1')
+        p_thread = plot_mc_curve(px, p, Path(p_curve_path), names, ylabel='Precision')
+        r_thread = plot_mc_curve(px, r, Path(r_curve_path), names, ylabel='Recall')
+        thread_join_status = [t.join() for t in [pr_thread, f1_thread, p_thread, r_thread]]
     i = smooth(f1.mean(0), 0.1).argmax()  # max F1 index
     p, r, f1 = p[:, i], r[:, i], f1[:, i]
     tp = (r * nt).round()  # true positives
@@ -209,7 +214,8 @@ class ConfusionMatrix:
         ax.set_ylabel('True')
         ax.set_ylabel('Predicted')
         ax.set_title('Confusion Matrix')
-        fig.savefig(Path(save_dir) / 'confusion_matrix.png', dpi=250)
+        save_path = os.path.join(save_dir, 'confusion_matrix.png')
+        fig.savefig(save_path, dpi=250)
         plt.close(fig)
 
     def print(self):

@@ -19,12 +19,6 @@ def is_url(url, check=True):
         return False
 
 
-def gsutil_getsize(url=''):
-    # gs://bucket/file size https://cloud.google.com/storage/docs/gsutil/commands/du
-    s = subprocess.check_output(f'gsutil du {url}', shell=True).decode('utf-8')
-    return eval(s.split(' ')[0]) if len(s) else 0  # bytes
-
-
 def url_getsize(url='https://ultralytics.com/images/bus.jpg'):
     # Return downloadable file size in bytes
     response = requests.head(url, allow_redirects=True)
