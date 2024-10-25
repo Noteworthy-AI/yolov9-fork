@@ -222,13 +222,3 @@ def smooth(y, f=0.05):
     p = np.ones(nf // 2)  # ones padding
     yp = np.concatenate((p * y[0], y, p * y[-1]), 0)  # y padded
     return np.convolve(yp, np.ones(nf) / nf, mode='valid')  # y-smoothed
-
-
-def compute_fitness(in_metrics_df: pd.DataFrame, in_metric_weights: list = (0., 0., 0.5, 0., 0.5)) -> float:
-    mp = (in_metrics_df["pre"] * in_metrics_df["support"]).sum() / (in_metrics_df["support"]).sum()
-    mr = (in_metrics_df["rec"] * in_metrics_df["support"]).sum() / (in_metrics_df["support"]).sum()
-    mf1 = (in_metrics_df["f1"] * in_metrics_df["support"]).sum() / (in_metrics_df["support"]).sum()
-    map50 = (in_metrics_df["ap50"] * in_metrics_df["support"]).sum() / (in_metrics_df["support"]).sum()
-    map95 = (in_metrics_df["ap95"] * in_metrics_df["support"]).sum() / (in_metrics_df["support"]).sum()
-
-    return (np.asarray([in_metric_weights]) @ np.asarray([mp, mr, mf1, map50, map95])).item()
