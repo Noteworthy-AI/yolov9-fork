@@ -6,12 +6,11 @@ import pandas as pd
 from tqdm import tqdm
 from PIL import Image, ImageFile
 
-from utils.plots import plot_images
-from utils.torch_utils import smart_inference_mode
-from utils.general import non_max_suppression as nms
-from utils.general import TQDM_BAR_FORMAT, scale_boxes, xywh2xyxy
-from utils.object_det_eval import evaluate_detections, compute_obj_det_eval_metrics, compute_conf_mat
-from utils.object_det_plot import plot_confusion_matrix, plot_mc_curve, plot_pr_curve, format_conf_mat_df
+from .utils.torch_utils import smart_inference_mode
+from .utils.general import non_max_suppression as nms
+from .utils.general import TQDM_BAR_FORMAT, scale_boxes, xywh2xyxy
+from .utils.object_det_eval import evaluate_detections, compute_obj_det_eval_metrics, compute_conf_mat
+from .utils.object_det_plot import plot_confusion_matrix, plot_mc_curve, plot_pr_curve, format_conf_mat_df
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 

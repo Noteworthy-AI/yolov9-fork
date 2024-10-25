@@ -12,7 +12,7 @@ import signal
 import sys
 import time
 import urllib
-from copy import deepcopy
+import threading
 from datetime import datetime
 from itertools import repeat
 from multiprocessing.pool import ThreadPool
@@ -30,9 +30,6 @@ import pkg_resources as pkg
 import torch
 import torchvision
 import yaml
-
-from utils import TryExcept, emojis
-from utils.metrics import box_iou, fitness
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLO root directory
@@ -52,6 +49,44 @@ cv2.setNumThreads(0)  # prevent OpenCV from multithreading (incompatible with Py
 os.environ['NUMEXPR_MAX_THREADS'] = str(NUM_THREADS)  # NumExpr max threads
 os.environ['OMP_NUM_THREADS'] = '1' if platform.system() == 'darwin' else str(NUM_THREADS)  # OpenMP (PyTorch and SciPy)
 
+
+def emojis(str=''):
+    # Return platform-dependent emoji-safe version of string
+    return str.encode().decode('ascii', 'ignore') if platform.system() == 'Windows' else str
+
+
+class TryExcept(contextlib.ContextDecorator):
+    # YOLOv5 TryExcept class. Usage: @TryExcept() decorator or 'with TryExcept():' context manager
+    def __init__(self, msg=''):
+        self.msg = msg
+
+    def __enter__(self):
+        pass
+
+    def __exit__(self, exc_type, value, traceback):
+        if value:
+            print(emojis(f"{self.msg}{': ' if self.msg else ''}{value}"))
+        return True
+
+
+def threaded(func):
+    # Multi-threads a target function and returns thread. Usage: @threaded decorator
+
+    def wrapper(*args, **kwargs):
+        thread = threading.Thread(target=func, args=args, kwargs=kwargs, daemon=True)
+        thread.start()
+        return thread
+
+    return wrapper
+
+
+def join_threads(verbose=False):
+    main_thread = threading.current_thread()
+    for t in threading.enumerate():
+        if t is not main_thread:
+            if verbose:
+                print(f'Joining thread {t.name}')
+            t.join()
 
 def is_ascii(s=''):
     # Is string composed of all ASCII (no UTF) characters? (note str().isascii() introduced in python 3.7)
@@ -962,37 +997,6 @@ def strip_optimizer(f='best.pt', s=''):  # from utils.general import *; strip_op
     torch.save(x, s or f)
     mb = os.path.getsize(s or f) / 1E6  # filesize
     LOGGER.info(f"Optimizer stripped from {f},{f' saved as {s},' if s else ''} {mb:.1f}MB")
-
-
-def print_mutation(keys, results, hyp, save_dir, bucket, prefix=colorstr('evolve: ')):
-    evolve_csv = save_dir / 'evolve.csv'
-    evolve_yaml = save_dir / 'hyp_evolve.yaml'
-    keys = tuple(keys) + tuple(hyp.keys())  # [results + hyps]
-    keys = tuple(x.strip() for x in keys)
-    vals = results + tuple(hyp.values())
-    n = len(keys)
-
-    # Log to evolve.csv
-    s = '' if evolve_csv.exists() else (('%20s,' * n % keys).rstrip(',') + '\n')  # add header
-    with open(evolve_csv, 'a') as f:
-        f.write(s + ('%20.5g,' * n % vals).rstrip(',') + '\n')
-
-    # Save yaml
-    with open(evolve_yaml, 'w') as f:
-        data = pd.read_csv(evolve_csv)
-        data = data.rename(columns=lambda x: x.strip())  # strip keys
-        i = np.argmax(fitness(data.values[:, :4]))  #
-        generations = len(data)
-        f.write('# YOLO Hyperparameter Evolution Results\n' + f'# Best generation: {i}\n' +
-                f'# Last generation: {generations - 1}\n' + '# ' + ', '.join(f'{x.strip():>20s}' for x in keys[:7]) +
-                '\n' + '# ' + ', '.join(f'{x:>20.5g}' for x in data.values[i, :7]) + '\n\n')
-        yaml.safe_dump(data.loc[i][7:].to_dict(), f, sort_keys=False)
-
-    # Print to screen
-    LOGGER.info(prefix + f'{generations} generations finished, current result:\n' + prefix +
-                ', '.join(f'{x.strip():>20s}' for x in keys) + '\n' + prefix + ', '.join(f'{x:20.5g}'
-                                                                                         for x in vals) + '\n\n')
-
 
 def apply_classifier(x, model, img, im0):
     # Apply a second stage classifier to YOLO outputs

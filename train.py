@@ -16,16 +16,16 @@ from dataclasses import asdict
 from PIL import Image
 from torch.optim import lr_scheduler
 
-from eval import evaluate
-from models.yolo import Model
-from utils.plots import plot_images
-from utils.object_det_eval import compute_fitness
-from utils.loss_tal import ComputeLoss as ComputeLossGELAN
-from utils.loss_tal_dual import ComputeLoss as ComputeLossPGI
-from utils.dataloaders import create_dataloader
-from utils.autobatch import check_train_batch_size
-from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, smart_DDP, smart_optimizer, smart_resume, torch_distributed_zero_first
-from utils.general import TQDM_BAR_FORMAT, check_amp, check_img_size, colorstr, init_seeds, intersect_dicts, \
+from .eval import evaluate
+from .models.yolo import Model
+from .utils.plots import plot_images
+from .utils.object_det_eval import compute_fitness
+from .utils.loss_tal import ComputeLoss as ComputeLossGELAN
+from .utils.loss_tal_dual import ComputeLoss as ComputeLossPGI
+from .utils.dataloaders import create_dataloader
+from .utils.autobatch import check_train_batch_size
+from .utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, smart_DDP, smart_optimizer, smart_resume, torch_distributed_zero_first
+from .utils.general import TQDM_BAR_FORMAT, check_amp, check_img_size, colorstr, init_seeds, intersect_dicts, \
     labels_to_class_weights, labels_to_image_weights, one_cycle, one_flat_cycle, strip_optimizer
 
 
@@ -37,6 +37,7 @@ def train(cfg, device, wandb_logger, mldb_logger):
     train_cfg = cfg.training
     nc = cfg.get_n_classes()  # number of classes
     names = cfg.dset.class_list  # class names
+
     # Directories & filepaths
     save_dir = cfg.get_local_output_dir(exist_ok=True)
     results_file = os.path.join(save_dir, "results.txt")
@@ -54,30 +55,30 @@ def train(cfg, device, wandb_logger, mldb_logger):
     # Configure
     plots = not train_cfg.evolve  # create plots
     cuda = device.type != 'cpu'
-    init_seeds(2 + train_cfg.global_rank)
+    # init_seeds(2 + train_cfg.global_rank)
 
     # Initialize YOLOv9 Model
-    print("Initializing model & optimizer")
-    ckpt = torch.load(local_w_pth, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
-    model_cfg = cfg.get_model_cfg()
-    model = Model(model_cfg, ch=3, nc=nc, anchors=train_cfg.anchors).to(device)
-    model.hyp = asdict(train_cfg)  # attach hyperparameters to model
-    model.names = names
-    exclude = ['anchor'] if not cfg.resume.enabled else []  # exclude keys
-    state_dict = ckpt['model'].float().state_dict()  # to FP32
-    state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
-    model.load_state_dict(state_dict, strict=False)      # Load state dictionary
-    amp = check_amp(model)
-    print(f"- transferred {len(state_dict)}/{len(model.state_dict())} items from {local_w_pth}")
+    # print("Initializing model & optimizer")
+    # ckpt = torch.load(local_w_pth, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
+    # model_cfg = cfg.get_model_cfg()
+    # model = Model(model_cfg, ch=3, nc=nc, anchors=train_cfg.anchors).to(device)
+    # model.hyp = asdict(train_cfg)  # attach hyperparameters to model
+    # model.names = names
+    # exclude = ['anchor'] if not cfg.resume.enabled else []  # exclude keys
+    # state_dict = ckpt['model'].float().state_dict()  # to FP32
+    # state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
+    # model.load_state_dict(state_dict, strict=False)      # Load state dictionary
+    # amp = check_amp(model)
+    # print(f"- transferred {len(state_dict)}/{len(model.state_dict())} items from {local_w_pth}")
 
     # Freeze model params
-    freeze = cfg.model.freeze
-    freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]
-    for k, v in model.named_parameters():
-        v.requires_grad = True  # train all layers
-        if any(x in k for x in freeze):
-            print(f"- freezing {k}")
-            v.requires_grad = False
+    # freeze = cfg.model.freeze
+    # freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]
+    # for k, v in model.named_parameters():
+    #     v.requires_grad = True  # train all layers
+    #     if any(x in k for x in freeze):
+    #         print(f"- freezing {k}")
+    #         v.requires_grad = False
 
     # Initialize W&B logging
     with torch_distributed_zero_first(train_cfg.local_rank):
@@ -92,73 +93,72 @@ def train(cfg, device, wandb_logger, mldb_logger):
             }
             wandb_logger.save_json_artifact(train_val_split, cfg.model_name, [], "dataset")
 
-    # Image size
-    gs = max(int(model.stride.max()), 32)  # grid size (max stride)
-    train_cfg.img_size = check_img_size(train_cfg.img_size, gs, floor=gs * 2)  # verify imgsz is gs-multiple
+    # # Image size
+    # gs = max(int(model.stride.max()), 32)  # grid size (max stride)
+    # train_cfg.img_size = check_img_size(train_cfg.img_size, gs, floor=gs * 2)  # verify imgsz is gs-multiple
 
     # Batch size
-    if train_cfg.global_rank == -1 and train_cfg.auto_batchsize:  # single-GPU only, estimate best batch size
-        batch_size = check_train_batch_size(model, train_cfg.img_size, amp)
-        total_batch_size = train_cfg.total_batch_size
-
-    else:
-        batch_size = train_cfg.total_batch_size // train_cfg.world_size
-        total_batch_size = train_cfg.total_batch_size
-
-    print(f"Training with a total batch size of {total_batch_size} ({batch_size} for {train_cfg.world_size} devices)")
+    # if train_cfg.global_rank == -1 and train_cfg.auto_batchsize:  # single-GPU only, estimate best batch size
+    #     batch_size = check_train_batch_size(model, train_cfg.img_size, amp)
+    #     total_batch_size = train_cfg.total_batch_size
+    #
+    # else:
+    #     batch_size = train_cfg.total_batch_size // train_cfg.world_size
+    #     total_batch_size = train_cfg.total_batch_size
+    #
+    # print(f"Training with a total batch size of {total_batch_size} ({batch_size} for {train_cfg.world_size} devices)")
 
     # Loss Function
-    model_arch_type = cfg.get_model_arch_type()
-    if model_arch_type == "gelan":
-        compute_loss = ComputeLossGELAN(model)  # Loss function for GELAN architecture
-    elif model_arch_type == "pgi":
-        compute_loss = ComputeLossPGI(model)  # Loss function for full YOLOv9 (GELAN+PGI) architecture
-    else:
-        raise Exception("Invalid model architecture type")
+    # model_arch_type = cfg.get_model_arch_type()
+    # if model_arch_type == "gelan":
+    #     compute_loss = ComputeLossGELAN(model)  # Loss function for GELAN architecture
+    # elif model_arch_type == "pgi":
+    #     compute_loss = ComputeLossPGI(model)  # Loss function for full YOLOv9 (GELAN+PGI) architecture
+    # else:
+    #     raise Exception("Invalid model architecture type")
 
-    # Optimizer
-    nbs = 64  # nominal batch size
-    accumulate = max(round(nbs / total_batch_size), 1)  # accumulate loss before optimizing
-    train_cfg.weight_decay *= total_batch_size * accumulate / nbs  # scale weight_decay
-    optimizer = smart_optimizer(model, train_cfg.optimizer, train_cfg.lr0, train_cfg.momentum, train_cfg.weight_decay)
+    # # Optimizer
+    # nbs = 64  # nominal batch size
+    # accumulate = max(round(nbs / total_batch_size), 1)  # accumulate loss before optimizing
+    # train_cfg.weight_decay *= total_batch_size * accumulate / nbs  # scale weight_decay
+    # optimizer = smart_optimizer(model, train_cfg.optimizer, train_cfg.lr0, train_cfg.momentum, train_cfg.weight_decay)
 
-    # Model Exponential Moving Average (EMA)
-    ema = ModelEMA(model) if train_cfg.global_rank in {-1, 0} else None
+
 
     # Resume & initialize early stopping TODO: verify this, not sure if this is correct
-    early_stopping, stop = EarlyStopping(patience=train_cfg.patience), False
-    start_epoch = 0
-    if cfg.resume.enabled:
-        best_fitness, start_epoch = smart_resume(ckpt, optimizer, ema, train_cfg.epochs)
-        early_stopping.best_fitness = best_fitness
-        early_stopping.best_epoch = start_epoch
-    del ckpt, state_dict
+    # early_stopping, stop = EarlyStopping(patience=train_cfg.patience), False
+    # start_epoch = 0
+    # if cfg.resume.enabled:
+    #     best_fitness, start_epoch = smart_resume(ckpt, optimizer, ema, train_cfg.epochs)
+    #     early_stopping.best_fitness = best_fitness
+    #     early_stopping.best_epoch = start_epoch
+    # del ckpt, state_dict
 
     # Learning Rate Scheduler & Grad Scaler
-    if train_cfg.lr_mode == "cos":
-        lf = one_cycle(1, train_cfg.lrf, train_cfg.epochs)  # cosine 1->hyp['lrf']
-    elif train_cfg.lr_mode == "flat_cos":
-        lf = one_flat_cycle(1, train_cfg.lrf, train_cfg.epochs)  # flat cosine 1->hyp['lrf']
-    elif train_cfg.lr_mode == "fixed":
-        lf = lambda x: 1.0
-    elif train_cfg.lr_mode == "linear":
-        lf = lambda x: (1 - x / train_cfg.epochs) * (1.0 - train_cfg.lrf) + train_cfg.lrf # linear
-    else:
-        raise Exception("Invalid LR mode")
-
-    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
-    scheduler.last_epoch = start_epoch - 1  # do not move
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    # if train_cfg.lr_mode == "cos":
+    #     lf = one_cycle(1, train_cfg.lrf, train_cfg.epochs)  # cosine 1->hyp['lrf']
+    # elif train_cfg.lr_mode == "flat_cos":
+    #     lf = one_flat_cycle(1, train_cfg.lrf, train_cfg.epochs)  # flat cosine 1->hyp['lrf']
+    # elif train_cfg.lr_mode == "fixed":
+    #     lf = lambda x: 1.0
+    # elif train_cfg.lr_mode == "linear":
+    #     lf = lambda x: (1 - x / train_cfg.epochs) * (1.0 - train_cfg.lrf) + train_cfg.lrf # linear
+    # else:
+    #     raise Exception("Invalid LR mode")
+    #
+    # scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
+    # scheduler.last_epoch = start_epoch - 1  # do not move
+    # scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
     # DP mode
-    if cuda and train_cfg.global_rank == -1 and torch.cuda.device_count() > 1:
-        print("Using DP mode, not DDP")
-        model = torch.nn.DataParallel(model)
-
-    # SyncBatchNorm
-    if train_cfg.sync_bn and cuda and train_cfg.global_rank != -1:
-        print("Using SyncBatchNorm for DDP")
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
+    # if cuda and train_cfg.global_rank == -1 and torch.cuda.device_count() > 1:
+    #     print("Using DP mode, not DDP")
+    #     model = torch.nn.DataParallel(model)
+    #
+    # # SyncBatchNorm
+    # if train_cfg.sync_bn and cuda and train_cfg.global_rank != -1:
+    #     print("Using SyncBatchNorm for DDP")
+    #     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
 
     # Dataloaders TODO: run experiments on "close mosaic" & "min_items"
     print("Initializing data loaders")
