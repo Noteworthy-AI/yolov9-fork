@@ -1,7 +1,8 @@
 import argparse
 import os
-import platform
 import sys
+import logging
+import platform
 from copy import deepcopy
 from pathlib import Path
 
@@ -14,7 +15,7 @@ if platform.system() != 'Windows':
 
 from .common import *
 from .experimental import *
-from utils.general import LOGGER, check_yaml, make_divisible, print_args
+from utils.general import check_yaml, make_divisible, print_args
 from utils.plots import feature_visualization
 from utils.torch_utils import (fuse_conv_and_bn, initialize_weights, model_info, profile, scale_img, select_device,
                                time_sync)
@@ -25,6 +26,8 @@ try:
 except ImportError:
     thop = None
 
+# Initialize logging
+mlod_log = logging.getLogger("mlod_training_logs")
 
 class Detect(nn.Module):
     # YOLO Detect head for detection models
@@ -492,13 +495,13 @@ class BaseModel(nn.Module):
             m(x.copy() if c else x)
         dt.append((time_sync() - t) * 100)
         if m == self.model[0]:
-            LOGGER.info(f"{'time (ms)':>10s} {'GFLOPs':>10s} {'params':>10s}  module")
-        LOGGER.info(f'{dt[-1]:10.2f} {o:10.2f} {m.np:10.0f}  {m.type}')
+            mlod_log.debug(f"{'time (ms)':>10s} {'GFLOPs':>10s} {'params':>10s}  module")
+        mlod_log.debug(f'{dt[-1]:10.2f} {o:10.2f} {m.np:10.0f}  {m.type}')
         if c:
-            LOGGER.info(f"{sum(dt):10.2f} {'-':>10s} {'-':>10s}  Total")
+            mlod_log.debug(f"{sum(dt):10.2f} {'-':>10s} {'-':>10s}  Total")
 
     def fuse(self):  # fuse model Conv2d() + BatchNorm2d() layers
-        LOGGER.info('Fusing layers... ')
+        mlod_log.debug('Fusing layers... ')
         for m in self.model.modules():
             if isinstance(m, (RepConvN)) and hasattr(m, 'fuse_convs'):
                 m.fuse_convs()
@@ -540,10 +543,10 @@ class DetectionModel(BaseModel):
         # Define model
         ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # input channels
         if nc and nc != self.yaml['nc']:
-            LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
+            mlod_log.debug(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
             self.yaml['nc'] = nc  # override yaml value
         if anchors:
-            LOGGER.info(f'Overriding model.yaml anchors with anchors={anchors}')
+            mlod_log.debug(f'Overriding model.yaml anchors with anchors={anchors}')
             self.yaml['anchors'] = round(anchors)  # override yaml value
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
@@ -574,7 +577,7 @@ class DetectionModel(BaseModel):
         # Init weights, biases
         initialize_weights(self)
         self.info()
-        LOGGER.info('')
+        mlod_log.debug('')
 
     def forward(self, x, augment=False, profile=False, visualize=False):
         if augment:
@@ -626,11 +629,11 @@ class DetectionModel(BaseModel):
 
 def parse_model(d, ch):  # model_dict, input_channels(3)
     # Parse a YOLO model.yaml dictionary
-    LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
+    mlod_log.debug(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
     anchors, nc, gd, gw, act = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple'], d.get('activation')
     if act:
         Conv.default_act = eval(act)  # redefine default activation, i.e. Conv.default_act = nn.SiLU()
-        LOGGER.info(f"{colorstr('activation:')} {act}")  # print
+        mlod_log.debug(f"activation: {act}")  # print
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
     no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
 
@@ -686,7 +689,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         t = str(m)[8:-2].replace('__main__.', '')  # module type
         np = sum(x.numel() for x in m_.parameters())  # number params
         m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params
-        LOGGER.info(f'{i:>3}{str(f):>18}{n_:>3}{np:10.0f}  {t:<40}{str(args):<30}')  # print
+        mlod_log.debug(f'{i:>3}{str(f):>18}{n_:>3}{np:10.0f}  {t:<40}{str(args):<30}')  # print
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
         if i == 0:

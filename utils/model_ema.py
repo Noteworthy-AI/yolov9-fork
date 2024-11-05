@@ -32,19 +32,3 @@ class ModelEMA:
     def update_attr(self, model, include=(), exclude=('process_group', 'reducer')):
         # Update EMA attributes
         copy_attr(self.ema, model, include, exclude)
-
-def smart_resume(ckpt, optimizer, ema, epochs):
-    # Resume training from a partially trained checkpoint
-    best_fitness = 0.0
-    start_epoch = 0
-    if ckpt.get('epoch') and isinstance(ckpt.get('epoch'), int):
-        start_epoch = ckpt['epoch'] + 1
-    if optimizer and ckpt.get('optimizer') and ckpt.get('best_fitness'):
-        optimizer.load_state_dict(ckpt['optimizer'])  # optimizer
-        best_fitness = ckpt['best_fitness']
-    if ema and ckpt.get('ema') and ckpt.get('updates'):
-        ema.ema.load_state_dict(ckpt['ema'].float().state_dict())  # EMA
-        ema.updates = ckpt['updates']
-    if epochs < start_epoch:
-        assert start_epoch < epochs, f"Start epoch {start_epoch} from checkpoint cannot be higher than total epochs {epochs}."
-    return best_fitness, start_epoch

@@ -1,25 +1,29 @@
-import math
 import os
+import math
+import time
+import logging
+import warnings
 import platform
 import subprocess
-import time
-import warnings
-from contextlib import contextmanager
-from copy import deepcopy
 from pathlib import Path
+from copy import deepcopy
+from contextlib import contextmanager
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from .general import LOGGER, check_version, file_date, git_describe
+from .general import check_version, file_date, git_describe
 
 try:
     import thop  # for FLOPs computation
 except ImportError:
     thop = None
+
+# Initialize logging
+mlod_log = logging.getLogger("mlod_training_logs")
 
 # Suppress PyTorch warnings
 warnings.filterwarnings('ignore', message='User provided device_type of \'cuda\', but CUDA is not available. Disabling')
@@ -128,7 +132,7 @@ def select_device(device='', batch_size=0, newline=True):
 
     if not newline:
         s = s.rstrip()
-    LOGGER.info(s)
+    mlod_log.debug(s)
     return torch.device(arg)
 
 
@@ -150,7 +154,7 @@ def profile(input, ops, n=10, device=None):
     results = []
     if not isinstance(device, torch.device):
         device = select_device(device)
-    print(f"{'Params':>12s}{'GFLOPs':>12s}{'GPU_mem (GB)':>14s}{'forward (ms)':>14s}{'backward (ms)':>14s}"
+    mlod_log.debug(f"{'Params':>12s}{'GFLOPs':>12s}{'GPU_mem (GB)':>14s}{'forward (ms)':>14s}{'backward (ms)':>14s}"
           f"{'input':>24s}{'output':>24s}")
 
     for x in input if isinstance(input, list) else [input]:
@@ -174,17 +178,17 @@ def profile(input, ops, n=10, device=None):
                         _ = (sum(yi.sum() for yi in y) if isinstance(y, list) else y).sum().backward()
                         t[2] = time_sync()
                     except Exception:  # no backward method
-                        # print(e)  # for debug
+                        # mlod_log.warning(e)  # for debug
                         t[2] = float('nan')
                     tf += (t[1] - t[0]) * 1000 / n  # ms per op forward
                     tb += (t[2] - t[1]) * 1000 / n  # ms per op backward
                 mem = torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0  # (GB)
                 s_in, s_out = (tuple(x.shape) if isinstance(x, torch.Tensor) else 'list' for x in (x, y))  # shapes
                 p = sum(x.numel() for x in m.parameters()) if isinstance(m, nn.Module) else 0  # parameters
-                print(f'{p:12}{flops:12.4g}{mem:>14.3f}{tf:14.4g}{tb:14.4g}{str(s_in):>24s}{str(s_out):>24s}')
+                mlod_log.debug(f'{p:12}{flops:12.4g}{mem:>14.3f}{tf:14.4g}{tb:14.4g}{str(s_in):>24s}{str(s_out):>24s}')
                 results.append([p, flops, mem, tf, tb, s_in, s_out])
             except Exception as e:
-                print(e)
+                mlod_log.warning(e)
                 results.append(None)
             torch.cuda.empty_cache()
     return results
@@ -233,7 +237,7 @@ def prune(model, amount=0.3):
         if isinstance(m, nn.Conv2d):
             prune.l1_unstructured(m, name='weight', amount=amount)  # prune
             prune.remove(m, 'weight')  # make permanent
-    LOGGER.info(f'Model pruned to {sparsity(model):.3g} global sparsity')
+    mlod_log.debug(f'Model pruned to {sparsity(model):.3g} global sparsity')
 
 
 def fuse_conv_and_bn(conv, bn):
@@ -265,10 +269,10 @@ def model_info(model, verbose=False, imgsz=640):
     n_p = sum(x.numel() for x in model.parameters())  # number parameters
     n_g = sum(x.numel() for x in model.parameters() if x.requires_grad)  # number gradients
     if verbose:
-        print(f"{'layer':>5} {'name':>40} {'gradient':>9} {'parameters':>12} {'shape':>20} {'mu':>10} {'sigma':>10}")
+        mlod_log.debug(f"{'layer':>5} {'name':>40} {'gradient':>9} {'parameters':>12} {'shape':>20} {'mu':>10} {'sigma':>10}")
         for i, (name, p) in enumerate(model.named_parameters()):
             name = name.replace('module_list.', '')
-            print('%5g %40s %9s %12g %20s %10.3g %10.3g' %
+            mlod_log.debug('%5g %40s %9s %12g %20s %10.3g %10.3g' %
                   (i, name, p.requires_grad, p.numel(), list(p.shape), p.mean(), p.std()))
 
     try:  # FLOPs
@@ -282,7 +286,7 @@ def model_info(model, verbose=False, imgsz=640):
         fs = ''
 
     name = Path(model.yaml_file).stem.replace('yolov5', 'YOLOv5') if hasattr(model, 'yaml_file') else 'Model'
-    print(f"{name} summary: {len(list(model.modules()))} layers, {n_p} parameters, {n_g} gradients{fs}")
+    mlod_log.debug(f"{name} summary: {len(list(model.modules()))} layers, {n_p} parameters, {n_g} gradients{fs}")
 
 
 def scale_img(img, ratio=1.0, same_shape=False, gs=32):  # img(16,3,256,416)
