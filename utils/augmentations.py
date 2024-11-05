@@ -1,17 +1,21 @@
+import cv2
+import torch
 import math
 import random
-
-import cv2
+import logging
 import numpy as np
-import torch
+
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 
-from utils.general import LOGGER, check_version, colorstr, resample_segments, segment2box, xywhn2xyxy
+from utils.general import check_version, colorstr, resample_segments, segment2box, xywhn2xyxy
 from utils.metrics import bbox_ioa
 
 IMAGENET_MEAN = 0.485, 0.456, 0.406  # RGB mean
 IMAGENET_STD = 0.229, 0.224, 0.225  # RGB standard deviation
+
+# Initialize logging
+mlod_log = logging.getLogger("mlod_training_logs")
 
 
 class Albumentations:
