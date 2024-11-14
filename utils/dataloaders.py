@@ -1,41 +1,36 @@
-import contextlib
-import glob
-import hashlib
-import json
-import math
 import os
+import glob
+import torch
 import random
 import shutil
-import time
-from dataclasses import asdict
-from itertools import repeat
-from multiprocessing.pool import Pool, ThreadPool
-from pathlib import Path
-from threading import Thread
-from urllib.parse import urlparse
-
-import numpy as np
 import psutil
-import torch
+import hashlib
+import logging
+import contextlib
+import numpy as np
 import torch.nn.functional as F
-import torchvision
-import yaml
-from PIL import ExifTags, Image, ImageOps
-from torch.utils.data import DataLoader, Dataset, dataloader, distributed
-from tqdm import tqdm
 
-from utils.augmentations import (Albumentations, augment_hsv, classify_albumentations, classify_transforms, copy_paste,
-                                 letterbox, mixup, random_perspective)
-from utils.general import (DATASETS_DIR, LOGGER, NUM_THREADS, TQDM_BAR_FORMAT, check_dataset, check_requirements,
-                           check_yaml, clean_str, cv2, is_colab, is_kaggle, segments2boxes, unzip_file, xyn2xy,
-                           xywh2xyxy, xywhn2xyxy, xyxy2xywhn)
-from utils.torch_utils import torch_distributed_zero_first
+from tqdm import tqdm
+from pathlib import Path
+from itertools import repeat
+from dataclasses import asdict
+from PIL import ExifTags, Image, ImageOps
+from multiprocessing.pool import Pool, ThreadPool
+from torch.utils.data import DataLoader, Dataset, dataloader, distributed
+
+from .torch_utils import torch_distributed_zero_first
+from .augmentations import Albumentations, augment_hsv, copy_paste, letterbox, mixup, random_perspective
+from .general import DATASETS_DIR, LOGGER, NUM_THREADS, TQDM_BAR_FORMAT, cv2, segments2boxes, xyn2xy, xywh2xyxy, \
+    xywhn2xyxy, xyxy2xywhn
 
 # Parameters
 HELP_URL = 'See https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data'
 IMG_FORMATS = 'bmp', 'dng', 'jpeg', 'jpg', 'mpo', 'png', 'tif', 'tiff', 'webp', 'pfm'  # include image suffixes
 VID_FORMATS = 'asf', 'avi', 'gif', 'm4v', 'mkv', 'mov', 'mp4', 'mpeg', 'mpg', 'ts', 'wmv'  # include video suffixes
 PIN_MEMORY = str(os.getenv('PIN_MEMORY', True)).lower() == 'true'  # global pin_memory for dataloaders
+
+# Initialize logging
+mlod_log = logging.getLogger("mlod_training_logs")
 
 # Get orientation exif tag
 for orientation in ExifTags.TAGS.keys():
@@ -212,9 +207,9 @@ class LoadImagesAndLabels(Dataset):
         nf, nm, ne, nc, n = cache.pop('results')  # found, missing, empty, corrupt, total
         if exists and local_rank in {-1, 0}:
             d = f"Scanning {cache_path}... {nf} images, {nm + ne} backgrounds, {nc} corrupt"
-            tqdm(None, desc=prefix + d, total=n, initial=n, bar_format=TQDM_BAR_FORMAT)  # display cache results
+            mlod_log.debug("- " + prefix + d) # display cache results
             if cache['msgs']:
-                LOGGER.info('\n'.join(cache['msgs']))  # display warnings
+                mlod_log.debug('\n'.join(cache['msgs']))  # display warnings
         assert nf > 0 or not augment, f'{prefix}No labels found in {cache_path}, can not start training. {HELP_URL}'
 
         # Read cache
@@ -230,7 +225,7 @@ class LoadImagesAndLabels(Dataset):
         # Filter images
         if min_items:
             include = np.array([len(x) >= min_items for x in self.labels]).nonzero()[0].astype(int)
-            LOGGER.info(f'{prefix}{n - len(include)}/{n} images filtered from dataset')
+            mlod_log.debug(f'{prefix}{n - len(include)}/{n} images filtered from dataset')
             self.im_files = [self.im_files[i] for i in include]
             self.label_files = [self.label_files[i] for i in include]
             self.labels = [self.labels[i] for i in include]
@@ -314,7 +309,7 @@ class LoadImagesAndLabels(Dataset):
         mem = psutil.virtual_memory()
         cache = mem_required * (1 + safety_margin) < mem.available  # to cache or not to cache, that is the question
         if not cache:
-            LOGGER.info(f"{prefix}{mem_required / gb:.1f}GB RAM required, "
+            mlod_log.debug(f"{prefix}{mem_required / gb:.1f}GB RAM required, "
                         f"{mem.available / gb:.1f}/{mem.total / gb:.1f}GB available, "
                         f"{'caching images ✅' if cache else 'not caching images ⚠️'}")
         return cache
@@ -342,7 +337,7 @@ class LoadImagesAndLabels(Dataset):
 
         pbar.close()
         if msgs:
-            LOGGER.info('\n'.join(msgs))
+            mlod_log.debug('\n'.join(msgs))
         if nf == 0:
             LOGGER.warning(f'{prefix}WARNING ⚠️ No labels found in {path}. {HELP_URL}')
         x['hash'] = get_hash(self.label_files + self.im_files)
@@ -352,7 +347,7 @@ class LoadImagesAndLabels(Dataset):
         try:
             np.save(path, x)  # save cache for next time
             path.with_suffix('.cache.npy').rename(path)  # remove .npy suffix
-            LOGGER.info(f'{prefix}New cache created: {path}')
+            mlod_log.debug(f'{prefix}New cache created: {path}')
         except Exception as e:
             LOGGER.warning(f'{prefix}WARNING ⚠️ Cache directory {path.parent} is not writeable: {e}')  # not writeable
         return x

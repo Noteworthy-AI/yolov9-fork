@@ -1,10 +1,12 @@
 import math
-
+import sys
+import types
 import numpy as np
 import torch
 import torch.nn as nn
 
 from utils.downloads import attempt_download
+from models.yolo import Detect, DetectionModel
 
 
 class Sum(nn.Module):
@@ -68,10 +70,23 @@ class Ensemble(nn.ModuleList):
 
 def attempt_load(weights, device=None, inplace=True, fuse=True):
     # Loads an ensemble of models weights=[a,b,c] or a single model weights=[a] or weights=a
-    from models.yolo import Detect, Model
 
     model = Ensemble()
     for w in weights if isinstance(weights, list) else [weights]:
+        # TODO: This is a bad hack and needs to be fixed at model save time
+        training_src = types.ModuleType("training_src")
+        training_src.yolov9 = types.ModuleType("training_src.yolov9")
+        training_src.yolov9.models = types.ModuleType("training_src.yolov9.models")
+        training_src.yolov9.models.yolo = sys.modules['models.yolo']
+        training_src.yolov9.models.common = sys.modules['models.common']
+
+        # Add each mock module to `sys.modules`
+        sys.modules['training_src'] = training_src
+        sys.modules['training_src.yolov9'] = training_src.yolov9
+        sys.modules['training_src.yolov9.models'] = training_src.yolov9.models
+        sys.modules['training_src.yolov9.models.yolo'] = training_src.yolov9.models.yolo
+        sys.modules['training_src.yolov9.models.common'] = training_src.yolov9.models.common
+
         ckpt = torch.load(attempt_download(w), map_location='cpu')  # load
         ckpt = (ckpt.get('ema') or ckpt['model']).to(device).float()  # FP32 model
 
@@ -86,7 +101,7 @@ def attempt_load(weights, device=None, inplace=True, fuse=True):
     # Module compatibility updates
     for m in model.modules():
         t = type(m)
-        if t in (nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6, nn.SiLU, Detect, Model):
+        if t in (nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6, nn.SiLU, Detect, DetectionModel):
             m.inplace = inplace  # torch 1.7.0 compatibility
             # if t is Detect and not isinstance(m.anchor_grid, list):
             #    delattr(m, 'anchor_grid')

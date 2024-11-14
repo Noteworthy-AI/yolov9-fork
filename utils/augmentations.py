@@ -22,7 +22,6 @@ class Albumentations:
     # YOLOv5 Albumentations class (optional, only used if package is installed)
     def __init__(self, size=640):
         self.transform = None
-        prefix = colorstr('albumentations: ')
         try:
             import albumentations as A
             check_version(A.__version__, '1.0.3', hard=True)  # version requirement
@@ -38,11 +37,11 @@ class Albumentations:
                 A.ImageCompression(quality_lower=75, p=0.0)]  # transforms
             self.transform = A.Compose(T, bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels']))
 
-            LOGGER.info(prefix + ', '.join(f'{x}'.replace('always_apply=False, ', '') for x in T if x.p))
+            mlod_log.debug('- albumentations: ' + ', '.join(f'{x}'.replace('always_apply=False, ', '') for x in T if x.p))
         except ImportError:  # package not installed, skip
             pass
         except Exception as e:
-            LOGGER.info(f'{prefix}{e}')
+            mlod_log.debug(f'albumentations: {e}')
 
     def __call__(self, im, labels, p=1.0):
         if self.transform and random.random() < p:
@@ -325,7 +324,7 @@ def classify_albumentations(
             T = [A.RandomResizedCrop(height=size, width=size, scale=scale, ratio=ratio)]
             if auto_aug:
                 # TODO: implement AugMix, AutoAug & RandAug in albumentation
-                LOGGER.info(f'{prefix}auto augmentations are currently not supported')
+                mlod_log.debug(f'{prefix}auto augmentations are currently not supported')
             else:
                 if hflip > 0:
                     T += [A.HorizontalFlip(p=hflip)]
@@ -337,13 +336,13 @@ def classify_albumentations(
         else:  # Use fixed crop for eval set (reproducibility)
             T = [A.SmallestMaxSize(max_size=size), A.CenterCrop(height=size, width=size)]
         T += [A.Normalize(mean=mean, std=std), ToTensorV2()]  # Normalize and convert to Tensor
-        LOGGER.info(prefix + ', '.join(f'{x}'.replace('always_apply=False, ', '') for x in T if x.p))
+        mlod_log.debug(prefix + ', '.join(f'{x}'.replace('always_apply=False, ', '') for x in T if x.p))
         return A.Compose(T)
 
     except ImportError:  # package not installed, skip
-        LOGGER.warning(f'{prefix}⚠️ not found, install with `pip install albumentations` (recommended)')
+        mlod_log.warning(f'{prefix}⚠️ not found, install with `pip install albumentations` (recommended)')
     except Exception as e:
-        LOGGER.info(f'{prefix}{e}')
+        mlod_log.debug(f'{prefix}{e}')
 
 
 def classify_transforms(size=224):

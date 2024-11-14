@@ -1,12 +1,9 @@
 import os
 import sys
-import math
-import torch
+import logging
 import platform
-import argparse
 from copy import deepcopy
 from pathlib import Path
-from torch import nn
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLO root directory
@@ -15,19 +12,21 @@ if str(ROOT) not in sys.path:
 if platform.system() != 'Windows':
     ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-from models.common import *
-from models.experimental import *
-from utils.general import LOGGER, check_version, check_yaml, make_divisible, print_args
+from .common import *
+from .experimental import *
+from utils.general import check_yaml, make_divisible, print_args
 from utils.plots import feature_visualization
 from utils.torch_utils import (fuse_conv_and_bn, initialize_weights, model_info, profile, scale_img, select_device,
                                time_sync)
-from utils.tal.anchor_generator import make_anchors, dist2bbox
+from loss.tal.anchor_generator import make_anchors, dist2bbox
 
 try:
     import thop  # for FLOPs computation
 except ImportError:
     thop = None
 
+# Initialize logging
+mlod_log = logging.getLogger("mlod_training_logs")
 
 class Detect(nn.Module):
     # YOLO Detect head for detection models
@@ -495,13 +494,13 @@ class BaseModel(nn.Module):
             m(x.copy() if c else x)
         dt.append((time_sync() - t) * 100)
         if m == self.model[0]:
-            LOGGER.info(f"{'time (ms)':>10s} {'GFLOPs':>10s} {'params':>10s}  module")
-        LOGGER.info(f'{dt[-1]:10.2f} {o:10.2f} {m.np:10.0f}  {m.type}')
+            mlod_log.debug(f"{'time (ms)':>10s} {'GFLOPs':>10s} {'params':>10s}  module")
+        mlod_log.debug(f'{dt[-1]:10.2f} {o:10.2f} {m.np:10.0f}  {m.type}')
         if c:
-            LOGGER.info(f"{sum(dt):10.2f} {'-':>10s} {'-':>10s}  Total")
+            mlod_log.debug(f"{sum(dt):10.2f} {'-':>10s} {'-':>10s}  Total")
 
     def fuse(self):  # fuse model Conv2d() + BatchNorm2d() layers
-        LOGGER.info('Fusing layers... ')
+        mlod_log.debug('Fusing layers... ')
         for m in self.model.modules():
             if isinstance(m, (RepConvN)) and hasattr(m, 'fuse_convs'):
                 m.fuse_convs()
@@ -543,10 +542,10 @@ class DetectionModel(BaseModel):
         # Define model
         ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # input channels
         if nc and nc != self.yaml['nc']:
-            LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
+            mlod_log.debug(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
             self.yaml['nc'] = nc  # override yaml value
         if anchors:
-            LOGGER.info(f'Overriding model.yaml anchors with anchors={anchors}')
+            mlod_log.debug(f'Overriding model.yaml anchors with anchors={anchors}')
             self.yaml['anchors'] = round(anchors)  # override yaml value
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
@@ -577,7 +576,7 @@ class DetectionModel(BaseModel):
         # Init weights, biases
         initialize_weights(self)
         self.info()
-        LOGGER.info('')
+        mlod_log.debug('')
 
     def forward(self, x, augment=False, profile=False, visualize=False):
         if augment:
@@ -627,48 +626,13 @@ class DetectionModel(BaseModel):
         return y
 
 
-Model = DetectionModel  # retain YOLO 'Model' class for backwards compatibility
-
-
-class SegmentationModel(DetectionModel):
-    # YOLO segmentation model
-    def __init__(self, cfg='yolo-seg.yaml', ch=3, nc=None, anchors=None):
-        super().__init__(cfg, ch, nc, anchors)
-
-
-class ClassificationModel(BaseModel):
-    # YOLO classification model
-    def __init__(self, cfg=None, model=None, nc=1000, cutoff=10):  # yaml, model, number of classes, cutoff index
-        super().__init__()
-        self._from_detection_model(model, nc, cutoff) if model is not None else self._from_yaml(cfg)
-
-    def _from_detection_model(self, model, nc=1000, cutoff=10):
-        # Create a YOLO classification model from a YOLO detection model
-        if isinstance(model, DetectMultiBackend):
-            model = model.model  # unwrap DetectMultiBackend
-        model.model = model.model[:cutoff]  # backbone
-        m = model.model[-1]  # last layer
-        ch = m.conv.in_channels if hasattr(m, 'conv') else m.cv1.conv.in_channels  # ch into module
-        c = Classify(ch, nc)  # Classify()
-        c.i, c.f, c.type = m.i, m.f, 'models.common.Classify'  # index, from, type
-        model.model[-1] = c  # replace
-        self.model = model.model
-        self.stride = model.stride
-        self.save = []
-        self.nc = nc
-
-    def _from_yaml(self, cfg):
-        # Create a YOLO classification model from a *.yaml file
-        self.model = None
-
-
 def parse_model(d, ch):  # model_dict, input_channels(3)
     # Parse a YOLO model.yaml dictionary
-    LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
+    mlod_log.debug(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
     anchors, nc, gd, gw, act = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple'], d.get('activation')
     if act:
         Conv.default_act = eval(act)  # redefine default activation, i.e. Conv.default_act = nn.SiLU()
-        LOGGER.info(f"{colorstr('activation:')} {act}")  # print
+        mlod_log.debug(f"activation: {act}")  # print
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
     no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
 
@@ -724,46 +688,10 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         t = str(m)[8:-2].replace('__main__.', '')  # module type
         np = sum(x.numel() for x in m_.parameters())  # number params
         m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params
-        LOGGER.info(f'{i:>3}{str(f):>18}{n_:>3}{np:10.0f}  {t:<40}{str(args):<30}')  # print
+        mlod_log.debug(f'{i:>3}{str(f):>18}{n_:>3}{np:10.0f}  {t:<40}{str(args):<30}')  # print
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
         if i == 0:
             ch = []
         ch.append(c2)
     return nn.Sequential(*layers), sorted(save)
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--cfg', type=str, default='yolo.yaml', help='model.yaml')
-    parser.add_argument('--batch-size', type=int, default=1, help='total batch size for all GPUs')
-    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
-    parser.add_argument('--profile', action='store_true', help='profile model speed')
-    parser.add_argument('--line-profile', action='store_true', help='profile model speed layer by layer')
-    parser.add_argument('--test', action='store_true', help='test all yolo*.yaml')
-    opt = parser.parse_args()
-    opt.cfg = check_yaml(opt.cfg)  # check YAML
-    print_args(vars(opt))
-    device = select_device(opt.device)
-
-    # Create model
-    im = torch.rand(opt.batch_size, 3, 640, 640).to(device)
-    model = Model(opt.cfg).to(device)
-    model.eval()
-
-    # Options
-    if opt.line_profile:  # profile layer by layer
-        model(im, profile=True)
-
-    elif opt.profile:  # profile forward-backward
-        results = profile(input=im, ops=[model], n=3)
-
-    elif opt.test:  # test all models
-        for cfg in Path(ROOT / 'models').rglob('yolo*.yaml'):
-            try:
-                _ = Model(cfg)
-            except Exception as e:
-                print(f'Error in {cfg}: {e}')
-
-    else:  # report fused model summary
-        model.fuse()

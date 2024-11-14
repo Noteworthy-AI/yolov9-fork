@@ -6,8 +6,8 @@ import torch.nn.functional as F
 
 from utils.general import xywh2xyxy
 from utils.metrics import bbox_iou
-from utils.tal.anchor_generator import dist2bbox, make_anchors, bbox2dist
-from utils.tal.assigner import TaskAlignedAssigner
+from .tal.anchor_generator import dist2bbox, make_anchors, bbox2dist
+from .tal.assigner import TaskAlignedAssigner
 from utils.torch_utils import de_parallel
 
 
@@ -103,7 +103,7 @@ class BboxLoss(nn.Module):
         return (loss_left + loss_right).mean(-1, keepdim=True)
 
 
-class ComputeLoss:
+class TripleTALoss:
     # Compute losses
     def __init__(self, model, use_dfl=True):
         device = next(model.parameters()).device  # get model device
@@ -135,7 +135,17 @@ class ComputeLoss:
                                             num_classes=self.nc,
                                             alpha=float(os.getenv('YOLOA', 0.5)),
                                             beta=float(os.getenv('YOLOB', 6.0)))
+        self.assigner2 = TaskAlignedAssigner(topk=int(os.getenv('YOLOM', 10)),
+                                            num_classes=self.nc,
+                                            alpha=float(os.getenv('YOLOA', 0.5)),
+                                            beta=float(os.getenv('YOLOB', 6.0)))
+        self.assigner3 = TaskAlignedAssigner(topk=int(os.getenv('YOLOM', 10)),
+                                            num_classes=self.nc,
+                                            alpha=float(os.getenv('YOLOA', 0.5)),
+                                            beta=float(os.getenv('YOLOB', 6.0)))
         self.bbox_loss = BboxLoss(m.reg_max - 1, use_dfl=use_dfl).to(device)
+        self.bbox_loss2 = BboxLoss(m.reg_max - 1, use_dfl=use_dfl).to(device)
+        self.bbox_loss3 = BboxLoss(m.reg_max - 1, use_dfl=use_dfl).to(device)
         self.proj = torch.arange(m.reg_max).float().to(device)  # / 120.0
         self.use_dfl = use_dfl
 
@@ -164,11 +174,24 @@ class ComputeLoss:
 
     def __call__(self, p, targets, img=None, epoch=0):
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
-        feats = p[1] if isinstance(p, tuple) else p
+        feats = p[1][0] if isinstance(p, tuple) else p[0]
+        feats2 = p[1][1] if isinstance(p, tuple) else p[1]
+        feats3 = p[1][2] if isinstance(p, tuple) else p[2]
+        
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1)
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+        
+        pred_distri2, pred_scores2 = torch.cat([xi.view(feats2[0].shape[0], self.no, -1) for xi in feats2], 2).split(
+            (self.reg_max * 4, self.nc), 1)
+        pred_scores2 = pred_scores2.permute(0, 2, 1).contiguous()
+        pred_distri2 = pred_distri2.permute(0, 2, 1).contiguous()
+        
+        pred_distri3, pred_scores3 = torch.cat([xi.view(feats3[0].shape[0], self.no, -1) for xi in feats3], 2).split(
+            (self.reg_max * 4, self.nc), 1)
+        pred_scores3 = pred_scores3.permute(0, 2, 1).contiguous()
+        pred_distri3 = pred_distri3.permute(0, 2, 1).contiguous()
 
         dtype = pred_scores.dtype
         batch_size, grid_size = pred_scores.shape[:2]
@@ -182,6 +205,8 @@ class ComputeLoss:
 
         # pboxes
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
+        pred_bboxes2 = self.bbox_decode(anchor_points, pred_distri2)  # xyxy, (b, h*w, 4)
+        pred_bboxes3 = self.bbox_decode(anchor_points, pred_distri3)  # xyxy, (b, h*w, 4)
 
         target_labels, target_bboxes, target_scores, fg_mask = self.assigner(
             pred_scores.detach().sigmoid(),
@@ -190,13 +215,33 @@ class ComputeLoss:
             gt_labels,
             gt_bboxes,
             mask_gt)
+        target_labels2, target_bboxes2, target_scores2, fg_mask2 = self.assigner2(
+            pred_scores2.detach().sigmoid(),
+            (pred_bboxes2.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt)
+        target_labels3, target_bboxes3, target_scores3, fg_mask3 = self.assigner3(
+            pred_scores3.detach().sigmoid(),
+            (pred_bboxes3.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt)
 
         target_bboxes /= stride_tensor
         target_scores_sum = max(target_scores.sum(), 1)
+        target_bboxes2 /= stride_tensor
+        target_scores_sum2 = max(target_scores2.sum(), 1)
+        target_bboxes3 /= stride_tensor
+        target_scores_sum3 = max(target_scores3.sum(), 1)
 
         # cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[1] = self.BCEcls(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        loss[1] = 0.25 * self.BCEcls(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum # BCE
+        loss[1] += 0.25 * self.BCEcls(pred_scores2, target_scores2.to(dtype)).sum() / target_scores_sum2 # BCE
+        loss[1] += self.BCEcls(pred_scores3, target_scores3.to(dtype)).sum() / target_scores_sum3 # BCE
 
         # bbox loss
         if fg_mask.sum():
@@ -207,6 +252,28 @@ class ComputeLoss:
                                                    target_scores,
                                                    target_scores_sum,
                                                    fg_mask)
+            loss[0] *= 0.25
+            loss[2] *= 0.25
+        if fg_mask2.sum():
+            loss0_, loss2_, iou2 = self.bbox_loss2(pred_distri2,
+                                                   pred_bboxes2,
+                                                   anchor_points,
+                                                   target_bboxes2,
+                                                   target_scores2,
+                                                   target_scores_sum2,
+                                                   fg_mask2)
+            loss[0] += 0.25 * loss0_
+            loss[2] += 0.25 * loss2_
+        if fg_mask3.sum():
+            loss0__, loss2__, iou3 = self.bbox_loss3(pred_distri3,
+                                                   pred_bboxes3,
+                                                   anchor_points,
+                                                   target_bboxes3,
+                                                   target_scores3,
+                                                   target_scores_sum3,
+                                                   fg_mask3)
+            loss[0] += loss0__
+            loss[2] += loss2__
 
         loss[0] *= 7.5  # box gain
         loss[1] *= 0.5  # cls gain
