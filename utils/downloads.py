@@ -7,6 +7,8 @@ from pathlib import Path
 import requests
 import torch
 
+from .general import LOGGER
+
 
 def is_url(url, check=True):
     # Check if string is URL and check if URL exists
@@ -19,12 +21,6 @@ def is_url(url, check=True):
         return False
 
 
-def gsutil_getsize(url=''):
-    # gs://bucket/file size https://cloud.google.com/storage/docs/gsutil/commands/du
-    s = subprocess.check_output(f'gsutil du {url}', shell=True).decode('utf-8')
-    return eval(s.split(' ')[0]) if len(s) else 0  # bytes
-
-
 def url_getsize(url='https://ultralytics.com/images/bus.jpg'):
     # Return downloadable file size in bytes
     response = requests.head(url, allow_redirects=True)
@@ -33,8 +29,6 @@ def url_getsize(url='https://ultralytics.com/images/bus.jpg'):
 
 def safe_download(file, url, url2=None, min_bytes=1E0, error_msg=''):
     # Attempts to download file from url or url2, checks and removes incomplete downloads < min_bytes
-    from utils.general import LOGGER
-
     file = Path(file)
     assert_msg = f"Downloaded file '{file}' does not exist or size is < min_bytes={min_bytes}"
     try:  # url1
@@ -56,8 +50,6 @@ def safe_download(file, url, url2=None, min_bytes=1E0, error_msg=''):
 
 def attempt_download(file, repo='ultralytics/yolov5', release='v7.0'):
     # Attempt file download from GitHub release assets if not found locally. release = 'latest', 'v7.0', etc.
-    from utils.general import LOGGER
-
     def github_assets(repository, version='latest'):
         # Return GitHub repo tag (i.e. 'v7.0') and assets (i.e. ['yolov5s.pt', 'yolov5m.pt', ...])
         if version != 'latest':

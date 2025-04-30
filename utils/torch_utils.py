@@ -1,30 +1,29 @@
-import math
 import os
+import math
+import time
+import logging
+import warnings
 import platform
 import subprocess
-import time
-import warnings
-from contextlib import contextmanager
-from copy import deepcopy
 from pathlib import Path
+from copy import deepcopy
+from contextlib import contextmanager
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from utils.general import LOGGER, check_version, colorstr, file_date, git_describe
-from utils.lion import Lion
-
-LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
-RANK = int(os.getenv('RANK', -1))
-WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
+from .general import check_version, file_date, git_describe
 
 try:
     import thop  # for FLOPs computation
 except ImportError:
     thop = None
+
+# Initialize logging
+mlod_log = logging.getLogger("mlod_training_logs")
 
 # Suppress PyTorch warnings
 warnings.filterwarnings('ignore', message='User provided device_type of \'cuda\', but CUDA is not available. Disabling')
@@ -48,15 +47,15 @@ def smartCrossEntropyLoss(label_smoothing=0.0):
     return nn.CrossEntropyLoss()
 
 
-def smart_DDP(model):
+def smart_DDP(model, cfg):
     # Model DDP creation with checks
     assert not check_version(torch.__version__, '1.12.0', pinned=True), \
         'torch==1.12.0 torchvision==0.13.0 DDP training is not supported due to a known issue. ' \
         'Please upgrade or downgrade torch to use DDP. See https://github.com/ultralytics/yolov5/issues/8395'
     if check_version(torch.__version__, '1.11.0'):
-        return DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK, static_graph=True)
+        return DDP(model, device_ids=[cfg.local_rank], output_device=cfg.local_rank, static_graph=True)
     else:
-        return DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK)
+        return DDP(model, device_ids=[cfg.local_rank], output_device=cfg.local_rank)
 
 
 def reshape_classifier_output(model, n=1000):
@@ -103,7 +102,7 @@ def device_count():
 
 def select_device(device='', batch_size=0, newline=True):
     # device = None or 'cpu' or 0 or '0' or '0,1,2,3'
-    s = f'YOLOv5 🚀 {git_describe() or file_date()} Python-{platform.python_version()} torch-{torch.__version__} '
+    s = f'YOLOv9 🚀 {git_describe() or file_date()} Python-{platform.python_version()} torch-{torch.__version__} '
     device = str(device).strip().lower().replace('cuda:', '').replace('none', '')  # to string, 'cuda:0' to '0'
     cpu = device == 'cpu'
     mps = device == 'mps'  # Apple Metal Performance Shaders (MPS)
@@ -133,7 +132,7 @@ def select_device(device='', batch_size=0, newline=True):
 
     if not newline:
         s = s.rstrip()
-    LOGGER.info(s)
+    mlod_log.debug(s)
     return torch.device(arg)
 
 
@@ -155,7 +154,7 @@ def profile(input, ops, n=10, device=None):
     results = []
     if not isinstance(device, torch.device):
         device = select_device(device)
-    print(f"{'Params':>12s}{'GFLOPs':>12s}{'GPU_mem (GB)':>14s}{'forward (ms)':>14s}{'backward (ms)':>14s}"
+    mlod_log.debug(f"{'Params':>12s}{'GFLOPs':>12s}{'GPU_mem (GB)':>14s}{'forward (ms)':>14s}{'backward (ms)':>14s}"
           f"{'input':>24s}{'output':>24s}")
 
     for x in input if isinstance(input, list) else [input]:
@@ -179,17 +178,17 @@ def profile(input, ops, n=10, device=None):
                         _ = (sum(yi.sum() for yi in y) if isinstance(y, list) else y).sum().backward()
                         t[2] = time_sync()
                     except Exception:  # no backward method
-                        # print(e)  # for debug
+                        # mlod_log.warning(e)  # for debug
                         t[2] = float('nan')
                     tf += (t[1] - t[0]) * 1000 / n  # ms per op forward
                     tb += (t[2] - t[1]) * 1000 / n  # ms per op backward
                 mem = torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0  # (GB)
                 s_in, s_out = (tuple(x.shape) if isinstance(x, torch.Tensor) else 'list' for x in (x, y))  # shapes
                 p = sum(x.numel() for x in m.parameters()) if isinstance(m, nn.Module) else 0  # parameters
-                print(f'{p:12}{flops:12.4g}{mem:>14.3f}{tf:14.4g}{tb:14.4g}{str(s_in):>24s}{str(s_out):>24s}')
+                mlod_log.debug(f'{p:12}{flops:12.4g}{mem:>14.3f}{tf:14.4g}{tb:14.4g}{str(s_in):>24s}{str(s_out):>24s}')
                 results.append([p, flops, mem, tf, tb, s_in, s_out])
             except Exception as e:
-                print(e)
+                mlod_log.warning(e)
                 results.append(None)
             torch.cuda.empty_cache()
     return results
@@ -238,7 +237,7 @@ def prune(model, amount=0.3):
         if isinstance(m, nn.Conv2d):
             prune.l1_unstructured(m, name='weight', amount=amount)  # prune
             prune.remove(m, 'weight')  # make permanent
-    LOGGER.info(f'Model pruned to {sparsity(model):.3g} global sparsity')
+    mlod_log.debug(f'Model pruned to {sparsity(model):.3g} global sparsity')
 
 
 def fuse_conv_and_bn(conv, bn):
@@ -270,10 +269,10 @@ def model_info(model, verbose=False, imgsz=640):
     n_p = sum(x.numel() for x in model.parameters())  # number parameters
     n_g = sum(x.numel() for x in model.parameters() if x.requires_grad)  # number gradients
     if verbose:
-        print(f"{'layer':>5} {'name':>40} {'gradient':>9} {'parameters':>12} {'shape':>20} {'mu':>10} {'sigma':>10}")
+        mlod_log.debug(f"{'layer':>5} {'name':>40} {'gradient':>9} {'parameters':>12} {'shape':>20} {'mu':>10} {'sigma':>10}")
         for i, (name, p) in enumerate(model.named_parameters()):
             name = name.replace('module_list.', '')
-            print('%5g %40s %9s %12g %20s %10.3g %10.3g' %
+            mlod_log.debug('%5g %40s %9s %12g %20s %10.3g %10.3g' %
                   (i, name, p.requires_grad, p.numel(), list(p.shape), p.mean(), p.std()))
 
     try:  # FLOPs
@@ -287,7 +286,7 @@ def model_info(model, verbose=False, imgsz=640):
         fs = ''
 
     name = Path(model.yaml_file).stem.replace('yolov5', 'YOLOv5') if hasattr(model, 'yaml_file') else 'Model'
-    LOGGER.info(f"{name} summary: {len(list(model.modules()))} layers, {n_p} parameters, {n_g} gradients{fs}")
+    mlod_log.debug(f"{name} summary: {len(list(model.modules()))} layers, {n_p} parameters, {n_g} gradients{fs}")
 
 
 def scale_img(img, ratio=1.0, same_shape=False, gs=32):  # img(16,3,256,416)
@@ -309,221 +308,3 @@ def copy_attr(a, b, include=(), exclude=()):
             continue
         else:
             setattr(a, k, v)
-
-
-def smart_optimizer(model, name='Adam', lr=0.001, momentum=0.9, decay=1e-5):
-    # YOLOv5 3-param group optimizer: 0) weights with decay, 1) weights no decay, 2) biases no decay
-    g = [], [], []  # optimizer parameter groups
-    bn = tuple(v for k, v in nn.__dict__.items() if 'Norm' in k)  # normalization layers, i.e. BatchNorm2d()
-    #for v in model.modules():
-    #    for p_name, p in v.named_parameters(recurse=0):
-    #        if p_name == 'bias':  # bias (no decay)
-    #            g[2].append(p)
-    #        elif p_name == 'weight' and isinstance(v, bn):  # weight (no decay)
-    #            g[1].append(p)
-    #        else:
-    #            g[0].append(p)  # weight (with decay)
-                
-    for v in model.modules():
-        if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):  # bias (no decay)
-            g[2].append(v.bias)
-        if isinstance(v, bn):  # weight (no decay)
-            g[1].append(v.weight)
-        elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):  # weight (with decay)
-            g[0].append(v.weight)
-            
-        if hasattr(v, 'im'):
-            if hasattr(v.im, 'implicit'):           
-                g[1].append(v.im.implicit)
-            else:
-                for iv in v.im:
-                    g[1].append(iv.implicit)
-        if hasattr(v, 'ia'):
-            if hasattr(v.ia, 'implicit'):           
-                g[1].append(v.ia.implicit)
-            else:
-                for iv in v.ia:
-                    g[1].append(iv.implicit)
-                    
-        if hasattr(v, 'im2'):
-            if hasattr(v.im2, 'implicit'):           
-                g[1].append(v.im2.implicit)
-            else:
-                for iv in v.im2:
-                    g[1].append(iv.implicit)
-        if hasattr(v, 'ia2'):
-            if hasattr(v.ia2, 'implicit'):           
-                g[1].append(v.ia2.implicit)
-            else:
-                for iv in v.ia2:
-                    g[1].append(iv.implicit)
-                    
-        if hasattr(v, 'im3'):
-            if hasattr(v.im3, 'implicit'):           
-                g[1].append(v.im3.implicit)
-            else:
-                for iv in v.im3:
-                    g[1].append(iv.implicit)
-        if hasattr(v, 'ia3'):
-            if hasattr(v.ia3, 'implicit'):           
-                g[1].append(v.ia3.implicit)
-            else:
-                for iv in v.ia3:
-                    g[1].append(iv.implicit)
-                    
-        if hasattr(v, 'im4'):
-            if hasattr(v.im4, 'implicit'):           
-                g[1].append(v.im4.implicit)
-            else:
-                for iv in v.im4:
-                    g[1].append(iv.implicit)
-        if hasattr(v, 'ia4'):
-            if hasattr(v.ia4, 'implicit'):           
-                g[1].append(v.ia4.implicit)
-            else:
-                for iv in v.ia4:
-                    g[1].append(iv.implicit)
-                    
-        if hasattr(v, 'im5'):
-            if hasattr(v.im5, 'implicit'):           
-                g[1].append(v.im5.implicit)
-            else:
-                for iv in v.im5:
-                    g[1].append(iv.implicit)
-        if hasattr(v, 'ia5'):
-            if hasattr(v.ia5, 'implicit'):           
-                g[1].append(v.ia5.implicit)
-            else:
-                for iv in v.ia5:
-                    g[1].append(iv.implicit)
-                    
-        if hasattr(v, 'im6'):
-            if hasattr(v.im6, 'implicit'):           
-                g[1].append(v.im6.implicit)
-            else:
-                for iv in v.im6:
-                    g[1].append(iv.implicit)
-        if hasattr(v, 'ia6'):
-            if hasattr(v.ia6, 'implicit'):           
-                g[1].append(v.ia6.implicit)
-            else:
-                for iv in v.ia6:
-                    g[1].append(iv.implicit)
-                    
-        if hasattr(v, 'im7'):
-            if hasattr(v.im7, 'implicit'):           
-                g[1].append(v.im7.implicit)
-            else:
-                for iv in v.im7:
-                    g[1].append(iv.implicit)
-        if hasattr(v, 'ia7'):
-            if hasattr(v.ia7, 'implicit'):           
-                g[1].append(v.ia7.implicit)
-            else:
-                for iv in v.ia7:
-                    g[1].append(iv.implicit)
-
-    if name == 'Adam':
-        optimizer = torch.optim.Adam(g[2], lr=lr, betas=(momentum, 0.999))  # adjust beta1 to momentum
-    elif name == 'AdamW':
-        optimizer = torch.optim.AdamW(g[2], lr=lr, betas=(momentum, 0.999), weight_decay=0.0, amsgrad=True)
-    elif name == 'RMSProp':
-        optimizer = torch.optim.RMSprop(g[2], lr=lr, momentum=momentum)
-    elif name == 'SGD':
-        optimizer = torch.optim.SGD(g[2], lr=lr, momentum=momentum, nesterov=True)
-    elif name == 'LION':
-        optimizer = Lion(g[2], lr=lr, betas=(momentum, 0.99), weight_decay=0.0)
-    else:
-        raise NotImplementedError(f'Optimizer {name} not implemented.')
-
-    optimizer.add_param_group({'params': g[0], 'weight_decay': decay})  # add g0 with weight_decay
-    optimizer.add_param_group({'params': g[1], 'weight_decay': 0.0})  # add g1 (BatchNorm2d weights)
-    LOGGER.info(f"{colorstr('optimizer:')} {type(optimizer).__name__}(lr={lr}) with parameter groups "
-                f"{len(g[1])} weight(decay=0.0), {len(g[0])} weight(decay={decay}), {len(g[2])} bias")
-    return optimizer
-
-
-def smart_hub_load(repo='ultralytics/yolov5', model='yolov5s', **kwargs):
-    # YOLOv5 torch.hub.load() wrapper with smart error/issue handling
-    if check_version(torch.__version__, '1.9.1'):
-        kwargs['skip_validation'] = True  # validation causes GitHub API rate limit errors
-    if check_version(torch.__version__, '1.12.0'):
-        kwargs['trust_repo'] = True  # argument required starting in torch 0.12
-    try:
-        return torch.hub.load(repo, model, **kwargs)
-    except Exception:
-        return torch.hub.load(repo, model, force_reload=True, **kwargs)
-
-
-def smart_resume(ckpt, optimizer, ema=None, weights='yolov5s.pt', epochs=300, resume=True):
-    # Resume training from a partially trained checkpoint
-    best_fitness = 0.0
-    start_epoch = ckpt['epoch'] + 1
-    if ckpt['optimizer'] is not None:
-        optimizer.load_state_dict(ckpt['optimizer'])  # optimizer
-        best_fitness = ckpt['best_fitness']
-    if ema and ckpt.get('ema'):
-        ema.ema.load_state_dict(ckpt['ema'].float().state_dict())  # EMA
-        ema.updates = ckpt['updates']
-    if resume:
-        assert start_epoch > 0, f'{weights} training to {epochs} epochs is finished, nothing to resume.\n' \
-                                f"Start a new training without --resume, i.e. 'python train.py --weights {weights}'"
-        LOGGER.info(f'Resuming training from {weights} from epoch {start_epoch} to {epochs} total epochs')
-    if epochs < start_epoch:
-        LOGGER.info(f"{weights} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {epochs} more epochs.")
-        epochs += ckpt['epoch']  # finetune additional epochs
-    return best_fitness, start_epoch, epochs
-
-
-class EarlyStopping:
-    # YOLOv5 simple early stopper
-    def __init__(self, patience=30):
-        self.best_fitness = 0.0  # i.e. mAP
-        self.best_epoch = 0
-        self.patience = patience or float('inf')  # epochs to wait after fitness stops improving to stop
-        self.possible_stop = False  # possible stop may occur next epoch
-
-    def __call__(self, epoch, fitness):
-        if fitness >= self.best_fitness:  # >= 0 to allow for early zero-fitness stage of training
-            self.best_epoch = epoch
-            self.best_fitness = fitness
-        delta = epoch - self.best_epoch  # epochs without improvement
-        self.possible_stop = delta >= (self.patience - 1)  # possible stop may occur next epoch
-        stop = delta >= self.patience  # stop training if patience exceeded
-        if stop:
-            LOGGER.info(f'Stopping training early as no improvement observed in last {self.patience} epochs. '
-                        f'Best results observed at epoch {self.best_epoch}, best model saved as best.pt.\n'
-                        f'To update EarlyStopping(patience={self.patience}) pass a new patience value, '
-                        f'i.e. `python train.py --patience 300` or use `--patience 0` to disable EarlyStopping.')
-        return stop
-
-
-class ModelEMA:
-    """ Updated Exponential Moving Average (EMA) from https://github.com/rwightman/pytorch-image-models
-    Keeps a moving average of everything in the model state_dict (parameters and buffers)
-    For EMA details see https://www.tensorflow.org/api_docs/python/tf/train/ExponentialMovingAverage
-    """
-
-    def __init__(self, model, decay=0.9999, tau=2000, updates=0):
-        # Create EMA
-        self.ema = deepcopy(de_parallel(model)).eval()  # FP32 EMA
-        self.updates = updates  # number of EMA updates
-        self.decay = lambda x: decay * (1 - math.exp(-x / tau))  # decay exponential ramp (to help early epochs)
-        for p in self.ema.parameters():
-            p.requires_grad_(False)
-
-    def update(self, model):
-        # Update EMA parameters
-        self.updates += 1
-        d = self.decay(self.updates)
-
-        msd = de_parallel(model).state_dict()  # model state_dict
-        for k, v in self.ema.state_dict().items():
-            if v.dtype.is_floating_point:  # true for FP16 and FP32
-                v *= d
-                v += (1 - d) * msd[k].detach()
-        # assert v.dtype == msd[k].dtype == torch.float32, f'{k}: EMA {v.dtype} and model {msd[k].dtype} must be FP32'
-
-    def update_attr(self, model, include=(), exclude=('process_group', 'reducer')):
-        # Update EMA attributes
-        copy_attr(self.ema, model, include, exclude)
